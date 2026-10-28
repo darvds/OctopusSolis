@@ -96,9 +96,15 @@ pyscript:
         # switch: input_boolean.solis_peak_export   # turn off to skip a day
         notify: false
 
-      # --- Axle Energy (top priority; the app stays off the inverter during events) ---
+      # --- Axle Energy (top priority) ---
       axle:
-        grace_minutes: 10
+        # true:  your Axle account is in Self-Dispatch mode, so the app exports during
+        #        Axle export events (Axle sends no inverter commands).
+        # false: Events Only mode. Axle drives the battery and the app stands aside.
+        # Switch the mode in your Axle account first. Never run true while Axle is in Events Only.
+        control: false
+        keep_evening_reserve: false   # with control: export down to battery.floor_soc
+        grace_minutes: 10             # Events Only: stay off the inverter this long after an event
         # event_type_sensor: sensor.axle_energy_event_type
         # event_start_sensor: sensor.axle_energy_event_start
         # event_end_sensor: sensor.axle_energy_event_end

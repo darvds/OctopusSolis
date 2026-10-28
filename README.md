@@ -24,7 +24,7 @@ Now one app decides what every slot should hold, in one pass, with one priority 
 
 | | Feature | What happens |
 |---|---|---|
-| 1 | **Axle Energy event** | Axle drives the battery. The app makes no inverter writes during the event and its grace period. The one exception: switching off one of its own slots that was still running when the event was announced. |
+| 1 | **Axle Energy event** | Depends on your Axle mode (see [Axle Energy](#axle-energy)). With **Self-Dispatch** the app exports during Axle export events itself, and pauses EV and happy hour charging into them. With **Events Only** Axle drives the battery, and the app makes no inverter writes during the event and its grace period. |
 | 2 | **EV-Follow charging** | While the car is smart-charging, the battery charges too, and any export window it overlaps is paused for those half-hours. |
 | 3 | **Octopus Power Down** | Exports everything above the evening reserve. It beats happy hour charging if they ever overlap. |
 | 4 | **Happy Hour / Power Up** | Charges at full speed and pauses any overlapping peak export. It can charge alongside EV-Follow. |
@@ -47,9 +47,33 @@ Before an Axle export event or a Power Down session, earlier export windows **ho
 
 Everything above the reserve is exported, capped by your inverter, battery current and export limit. The slot is written `prepare_minutes` before the window. During the window it's re-planned every minute from the real SOC.
 
-**Axle Energy.** The app reads the [Axle Energy integration](https://www.home-assistant.io/integrations/axle_energy/)'s event type, start and end sensors.
+**Axle Energy.** See [Axle Energy](#axle-energy) below.
 
 **Fail-safe.** Every slot has a fixed time window and stop SOC, so the inverter starts and stops by itself. If Home Assistant, pyscript or SolisCloud goes down, nothing runs past its window.
+
+## Axle Energy
+
+The app reads the [Axle Energy integration](https://www.home-assistant.io/integrations/axle_energy/)'s event type, start and end sensors. How it acts on them depends on the mode you've picked in your Axle account settings. Axle's article *Self-Dispatch Mode: How it Works* explains the modes:
+
+| Axle mode | Who drives the battery | Set in this app |
+|---|---|---|
+| **Self-Dispatch** | You. Axle *"doesn't send any commands to your inverter… no forced discharges, and no changes to your settings or modes."* | `axle: control: true` |
+| **Events Only** | Axle *"send[s] commands to start your export at the beginning of an event and reset[s] your battery at the end."* | `axle: control: false` (the default) |
+
+In both modes Axle pays the same way: it credits *"whatever you export to the grid during the scheduled event window"*. Standard events are announced the day before, and short-notice events, which you opt into, come 2 hours ahead. Event times never change once an event has started.
+
+**With `control: true` (Self-Dispatch)**
+- **Export events** are planned like any other export window and written `prepare_minutes` before the event. The battery exports everything above the **floor** (`battery.floor_soc`), spread over the event and capped by your inverter, battery current and export limit.
+  - The usual evening reserve isn't kept, because Axle's payment per kWh normally beats what the evening costs. Set `keep_evening_reserve: true` to keep it.
+  - Battery is still held back for a later Power Down session before the cheap window.
+- **Before an event**, earlier peak and Power Down windows hold back what the event can export.
+- **During an export event**, EV-Follow doesn't start or extend its slot. A half-hour that's already running finishes at the event start. A happy hour charges right up to the event start, then stops.
+- **Import events** pause exports. Charging (EV, happy hour) carries on as normal.
+- When the event ends, normal planning resumes straight away, with no grace period.
+
+**With `control: false` (Events Only)**, the app holds battery back before export events and makes no inverter writes during any Axle event plus `grace_minutes`. The one exception is switching off one of its own slots that would otherwise still be running.
+
+> **Match the app to your Axle mode.** Never set `control: true` while Axle is still in Events Only, or both will drive the battery. Switch Axle to Self-Dispatch first (Axle account → Settings), then set `control: true`. Axle advises against switching modes often.
 
 ## Requirements
 
@@ -186,7 +210,9 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 | `event_type_sensor` | `sensor.axle_energy_event_type` | Axle event type (`export` / `import`) |
 | `event_start_sensor` | `sensor.axle_energy_event_start` | Axle event start |
 | `event_end_sensor` | `sensor.axle_energy_event_end` | Axle event end |
-| `grace_minutes` | `10` | Stay off the inverter this long after an event |
+| `control` | `false` | `true` if your Axle account is in **Self-Dispatch** mode: the app exports during Axle export events. `false` for **Events Only**: Axle drives the battery and the app stands aside. |
+| `keep_evening_reserve` | `false` | With `control: true`: keep the evening reserve during Axle exports instead of exporting down to the floor |
+| `grace_minutes` | `10` | With `control: false`: stay off the inverter this long after an event |
 
 ## Monitoring
 
@@ -218,7 +244,7 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 - **A feature isn't doing anything.** Check the `features` attribute on `sensor.solis_octopus`. Then check the `*_events` health attributes on its own sensor. A typo in an entity ID shows as `missing`, with a `warning`.
 - **"Not starting: fix the slots config first".** Two features are set to the same charge slot. The details are in `slot_problems` on `sensor.solis_octopus`.
 - **Slots at the wrong times.** Check the inverter clock and `inverter_timezone`.
-- **Axle's settings get overwritten.** Make sure Axle doesn't use the same Solis slots as this app, and change `slots:` if it does.
+- **Axle's settings get overwritten (Events Only).** Make sure Axle doesn't use the same Solis slots as this app, and change `slots:` if it does. Or switch Axle to Self-Dispatch and set `axle: control: true`.
 - **Before sharing logs**, remove inverter serial numbers and your Octopus account ID.
 
 ## Development

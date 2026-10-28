@@ -47,7 +47,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 log = logging.getLogger("pyscript.solis_octopus")
 log.setLevel(logging.DEBUG)
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # -----------------------------
 # SolisCloud endpoints / constants
@@ -255,6 +255,11 @@ AXLE_START_SENSOR = str(AXC.get("event_start_sensor", "sensor.axle_energy_event_
 AXLE_END_SENSOR = str(AXC.get("event_end_sensor", "sensor.axle_energy_event_end"))
 AXLE_SENSORS = [AXLE_TYPE_SENSOR, AXLE_START_SENSOR, AXLE_END_SENSOR] if AXLE_EVENTS else []
 AXLE_GRACE_MINUTES = int(AXC.get("grace_minutes", 10))
+# Self-Dispatch (Axle sends no inverter commands): the app exports during Axle
+# export events. Otherwise (Events Only) Axle drives the battery and the app
+# stands aside.
+AXLE_CONTROL = _cfg_bool("control", False, AXC) and AXLE_EVENTS
+AXLE_KEEP_RESERVE = _cfg_bool("keep_evening_reserve", False, AXC)
 
 _missing_credentials = [k for k in ("key_id", "secret", "username", "password", "plantId") if not CFG.get(k)]
 INVERTER_CONTROL = not _missing_credentials
@@ -794,6 +799,17 @@ def next_half_hour(dt):
     return floor_half_hour(dt) + timedelta(minutes=30)
 
 
+def axle_dispatch(window):
+    """An Axle export event the app runs itself (Self-Dispatch)."""
+    return AXLE_CONTROL and window is not None and window.get("kind") == "axle_export"
+
+
+def stand_aside(window, now):
+    """An Axle event Axle is driving itself: no inverter writes."""
+    return (not AXLE_CONTROL) and window is not None and str(window.get("kind", "")).startswith("axle") \
+        and window["start"] <= now
+
+
 def overlaps(a_start, a_end, b_start, b_end):
     return a_start < b_end and b_start < a_end
 
@@ -921,7 +937,8 @@ def axle_event(now):
     event_end = parse_dt(hass.states.get(AXLE_END_SENSOR).state)
     if start is None or event_end is None or event_end <= start:
         return None
-    end = event_end + timedelta(minutes=AXLE_GRACE_MINUTES)
+    # No grace period when the app runs the event itself (Axle sends no commands).
+    end = event_end + timedelta(minutes=0 if AXLE_CONTROL else AXLE_GRACE_MINUTES)
     if end <= now:
         return None
     return {"id": f"axle-{start.astimezone(timezone.utc).strftime('%Y%m%dT%H%M')}",
@@ -1156,12 +1173,13 @@ def solar_forecast():
     return out
 
 
-def predict(session, now, soc, voltage, load_profile, solar, later=None):
+def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_to_floor=False):
     """
     Plan the export for the window `session`. All energies in kWh, powers in kW.
     `soc` is the battery SOC now (%), `load_profile` {local hour: kW},
     `solar` {UTC half-hour: kW}, `later` the windows after it and before the
-    cheap window (battery is held back for Power Down ones).
+    cheap window (battery is held back for Power Down ones). `drain_to_floor`
+    leaves out the evening reserve (Axle export events).
     """
     cap = BATTERY_CAPACITY_KWH
 
@@ -1204,7 +1222,7 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None):
 
     # Reserve: the floor, plus the house from session end until the cheap window.
     floor_kwh = FLOOR_SOC / 100.0 * cap
-    if in_core_window(end):
+    if drain_to_floor or in_core_window(end):
         evening_kwh = 0.0
     else:
         evening_kwh = net_drain(end, next_core_start(end))
@@ -1281,14 +1299,14 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None):
     }
 
 
-async def plan_for(session, now, later=None):
+async def plan_for(session, now, later=None, drain_to_floor=False):
     soc = _float_state(SOC_SENSOR)
     if soc is None:
         log.warning("SOC sensor '%s' unavailable; can't plan", SOC_SENSOR)
         return None
     voltage = _float_state(BATTERY_VOLTAGE_SENSOR)
     profile = await ensure_load_profile()
-    return predict(session, now, soc, voltage, profile, solar_forecast(), later)
+    return predict(session, now, soc, voltage, profile, solar_forecast(), later, drain_to_floor)
 
 
 def worth_exporting(plan):
@@ -1302,7 +1320,7 @@ def worth_exporting(plan):
 
 def export_desired(session, plan, now):
     """What the discharge slot should hold right now."""
-    if session is None or plan is None or is_axle(session):
+    if session is None or plan is None or (is_axle(session) and not axle_dispatch(session)):
         return {"window": EMPTY_SLOT, "current": None, "soc": None, "enabled": False}
     if now < session["start"] - timedelta(minutes=EXPORT_PREPARE_MINUTES) or now >= session["end"]:
         return {"window": EMPTY_SLOT, "current": None, "soc": None, "enabled": False}
@@ -1818,12 +1836,32 @@ def core_want():
     return {"window": CORE_WINDOW.replace(" ", ""), "current": None, "soc": None, "enabled": True}
 
 
-def arbitrate(now, ev_on, hh_window, hh_want, export_window, export_want):
+def arbitrate(now, ev_want, ev_on, hh_window, hh_want, export_window, export_want):
     """
-    Apply the priority order to the features' wishes. Returns (hh_want,
-    export_want, notes). Axle is handled by the caller (no writes at all).
+    Apply the priority order to the features' wishes. Returns (ev_want, hh_want,
+    export_want, notes). Axle events Axle drives itself are handled by the
+    caller (no writes at all).
     """
     notes = []
+    if export_want["enabled"] and axle_dispatch(export_window):
+        # An Axle export we run comes first: no grid charging into it.
+        a_start, a_end = export_window["start"], export_window["end"]
+        if ev_want["enabled"] and overlaps(ev_want["start"], ev_want["end"], a_start, a_end):
+            if _ev["end"] is not None and now < _ev["end"] <= a_start and _slots["ev"]["enabled"]:
+                # Let the half-hour that's already running finish, but don't extend into the event.
+                ev_want = dict(ev_want, window=fmt_slot(_ev["start"], _ev["end"]),
+                               start=_ev["start"], end=_ev["end"])
+            else:
+                ev_want = empty_want()
+            notes.append("EV charging paused: Axle export")
+        if hh_want["enabled"] and overlaps(hh_window["start"], hh_window["end"], a_start, a_end):
+            if hh_window["start"] < a_start and now < a_start:
+                # Free charging right up to the event, then stop.
+                hh_want = dict(hh_want, window=fmt_window(hh_window["start"], a_start))
+            else:
+                hh_want = empty_want()
+            notes.append("happy hour charging paused: Axle export")
+        return ev_want, hh_want, export_want, notes
     if export_want["enabled"] and ev_on:
         export_want = empty_want()
         notes.append("export paused: EV charging")
@@ -1835,7 +1873,7 @@ def arbitrate(now, ev_on, hh_window, hh_want, export_window, export_want):
         else:
             export_want = empty_want()
             notes.append("peak export paused: happy hour")
-    return hh_want, export_want, notes
+    return ev_want, hh_want, export_want, notes
 
 
 def order_ops(per_slot):
@@ -1891,11 +1929,12 @@ async def _reconcile(reason):
     hh_want = hh_desired(hh_window, now)
     export_window, later = export_target_window(now)
     plan = None
-    if export_window is not None and not is_axle(export_window):
-        plan = await plan_for(export_window, now, later)
+    if export_window is not None and (not is_axle(export_window) or axle_dispatch(export_window)):
+        plan = await plan_for(export_window, now, later,
+                              drain_to_floor=axle_dispatch(export_window) and not AXLE_KEEP_RESERVE)
     export_want = export_desired(export_window, plan, now)
 
-    axle_running = is_axle(export_window) and export_window["start"] <= now
+    axle_running = stand_aside(export_window, now)
     notes = []
     wants = {"core": core_want(), "ev": ev_want, "happy_hour": hh_want, "export": export_want}
     per_slot = {}
@@ -1908,13 +1947,16 @@ async def _reconcile(reason):
                 per_slot[key] = slot_ops(key, empty_want())
                 wants[key] = empty_want()
     else:
-        hh_want, export_want, notes = arbitrate(now, ev_on, hh_window, hh_want, export_window, export_want)
+        ev_want, hh_want, export_want, notes = arbitrate(now, ev_want, ev_on, hh_window, hh_want,
+                                                         export_window, export_want)
+        wants["ev"] = ev_want
         wants["happy_hour"] = hh_want
         wants["export"] = export_want
         for key in active_slot_keys():
             step = CURRENT_STEP_AMPS if key == "export" else 1
             per_slot[key] = slot_ops(key, wants[key], step)
-        if not wants["export"]["enabled"] and export_window is not None and not is_axle(export_window) \
+        if not wants["export"]["enabled"] and export_window is not None \
+                and (not is_axle(export_window) or axle_dispatch(export_window)) \
                 and plan is not None and not notes and not worth_exporting(plan):
             notes.append("export skipped: not enough spare energy")
 
@@ -1972,15 +2014,18 @@ async def after_write(now, wants, export_window, plan):
         return
     if export_window["id"] in _pd_joined["notified"]:
         return
-    is_power_down = export_window["kind"] == "power_down"
-    if not is_power_down and not NOTIFY_PEAK:
+    kind = export_window["kind"]
+    if kind == "peak" and not NOTIFY_PEAK:
         return
     _pd_joined["notified"].add(export_window["id"])
+    title = {"power_down": "Power Down export planned", "axle_export": "Axle export planned"}.get(
+        kind, "Peak export planned")
+    kept = "for the evening" if kind != "axle_export" or AXLE_KEEP_RESERVE else "in the battery"
     await notify(
-        "Power Down export planned" if is_power_down else "Peak export planned",
+        title,
         f"{plan['window']}: exporting ~{plan['predicted_export_kwh']} kWh at "
         f"{plan['discharge_current']} A, stopping at {plan['stop_soc']}% "
-        f"({plan['reserve_kwh']} kWh kept for the evening).",
+        f"({plan['reserve_kwh']} kWh kept {kept}).",
     )
 
 
@@ -2006,7 +2051,7 @@ def _slot_attrs(key):
 
 
 def publish_overview(now, export_window, hh_window):
-    if is_axle(export_window) and export_window["start"] <= now:
+    if stand_aside(export_window, now):
         state_value = "axle_event"
     elif _slots["export"]["enabled"] and export_window is not None and export_window["start"] <= now:
         state_value = "exporting"
@@ -2123,7 +2168,7 @@ def publish_export_status(session, plan, now, events_status="ok", axle_status="d
     active = running and session["kind"] == "power_down"
     if session is None:
         status = "idle"
-    elif is_axle(session):
+    elif is_axle(session) and not axle_dispatch(session):
         status = "axle_event" if running else "axle_upcoming"
     elif _last["decision"] and "export paused" in _last["decision"]:
         status = "paused"
@@ -2163,6 +2208,7 @@ def publish_export_status(session, plan, now, events_status="ok", axle_status="d
         attrs["axle_event_type"] = session["kind"][len("axle_"):]
         attrs["axle_event_start"] = to_local(session["start"]).isoformat()
         attrs["axle_event_end"] = to_local(session["event_end"]).isoformat()
+        attrs["axle_control"] = AXLE_CONTROL
     warnings = []
     for w in (pd_events_warning(events_status) if PD_ENABLED else None, axle_warning(axle_status)):
         if w:
@@ -2193,7 +2239,9 @@ else:
 async def solis_octopus_startup():
     log.info("=== Solis Octopus v%s starting (ev_follow=%s, happy_hour=%s, power_down=%s, "
              "peak_export=%s, axle=%s, tz %s, diagnostics_only=%s) ===", VERSION, EV_ENABLED,
-             HH_ENABLED, PD_ENABLED, PEAK_EXPORT, AXLE_EVENTS, INVERTER_TIMEZONE, DIAGNOSTICS_ONLY)
+             HH_ENABLED, PD_ENABLED, PEAK_EXPORT,
+             ("self-dispatch" if AXLE_CONTROL else "stand aside") if AXLE_EVENTS else False,
+             INVERTER_TIMEZONE, DIAGNOSTICS_ONLY)
     if SLOT_PROBLEMS:
         log.error("Not starting: fix the slots config first (%s)", "; ".join(SLOT_PROBLEMS))
         return
@@ -2323,11 +2371,12 @@ async def solis_octopus_preview():
                 export_window = s
     if export_window is None:
         log.info("Preview: no upcoming export window")
-    elif is_axle(export_window):
+    elif is_axle(export_window) and not axle_dispatch(export_window):
         log.info("Preview: next is an Axle %s event %s; the app stands aside",
                  export_window["kind"][len("axle_"):], fmt_window(export_window["start"], export_window["end"]))
     else:
-        plan = await plan_for(export_window, now, later)
+        plan = await plan_for(export_window, now, later,
+                              drain_to_floor=axle_dispatch(export_window) and not AXLE_KEEP_RESERVE)
         log.info("Preview export %s: %s", fmt_window(export_window["start"], export_window["end"]), plan)
     if HH_ENABLED:
         windows = happy_hours()
