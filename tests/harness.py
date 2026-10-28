@@ -193,6 +193,13 @@ class FakeServices:
     def boosts(self):
         return [c for c in self.calls if c["service"] == "boost_water_heater"]
 
+    def titles(self):
+        return [c["data"]["title"] for c in self.notifications()]
+
+    def others(self):
+        return [(c["domain"], c["service"]) for c in self.calls
+                if c["domain"] not in ("notify", "octopus_energy")]
+
 
 # -----------------------------
 # Fake SolisCloud

@@ -257,9 +257,11 @@ AXLE_SENSORS = [AXLE_TYPE_SENSOR, AXLE_START_SENSOR, AXLE_END_SENSOR] if AXLE_EV
 AXLE_GRACE_MINUTES = int(AXC.get("grace_minutes", 10))
 
 _missing_credentials = [k for k in ("key_id", "secret", "username", "password", "plantId") if not CFG.get(k)]
+INVERTER_CONTROL = not _missing_credentials
 if _missing_credentials:
-    log.error("SolisCloud credentials missing (%s); the inverter can't be controlled",
+    log.error("SolisCloud credentials missing (%s); the inverter won't be controlled",
               ", ".join(_missing_credentials))
+    HH_BATTERY_CHARGE = False
 if HOT_WATER_BOOST and not WATER_HEATER:
     log.error("happy_hour.hot_water_boost needs heat_pump_id or water_heater_entity; hot water boost is off")
     HOT_WATER_BOOST = False
@@ -1781,6 +1783,8 @@ def other_charge_slots():
 
 def active_slot_keys():
     keys = []
+    if not INVERTER_CONTROL:
+        return keys
     if MANAGE_CORE_SLOT:
         keys.append("core")
     if EV_ENABLED:
@@ -2325,7 +2329,19 @@ async def solis_octopus_preview():
         log.info("Preview export %s: %s", fmt_window(export_window["start"], export_window["end"]), plan)
     if HH_ENABLED:
         windows = happy_hours()
+        _, hh_available = hh_sessions()
         window = hh_target_window(windows, now)
+        upcoming = []
+        for w in windows:
+            if w["end"] > now:
+                upcoming.append(f"{fmt_day(w['start'])} {fmt_window(w['start'], w['end'])}")
+        bookable = []
+        for s in _by_start(hh_available):
+            if s["end"] > now:
+                bookable.append(f"{fmt_day(s['start'])} {fmt_window(s['start'], s['end'])} "
+                                f"({s['code']}, {s['availability'] or 'unknown'})")
+        log.info("Preview happy hours: booked=%s available=%s tokens=%s", upcoming or "none",
+                 bookable or "none", tokens_available())
         if window is None:
             log.info("Preview: no happy hour booked")
         else:
