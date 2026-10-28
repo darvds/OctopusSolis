@@ -2183,8 +2183,10 @@ def publish_export_status(session, plan, now, events_status="ok", axle_status="d
 # -----------------------------
 # Triggers
 # -----------------------------
-EV_TRIGGER_ENTITIES = [EV_CHARGER_SWITCH, EV_CHARGER_CURRENT, EV_DISPATCH_SENSOR] \
-    if EV_ENABLED and EV_DISPATCH_SENSOR else ["input_boolean.solis_octopus_ev_unconfigured"]
+if EV_ENABLED and EV_DISPATCH_SENSOR:
+    EV_T1, EV_T2, EV_T3 = EV_CHARGER_SWITCH, EV_CHARGER_CURRENT, EV_DISPATCH_SENSOR
+else:
+    EV_T1 = EV_T2 = EV_T3 = "input_boolean.solis_octopus_ev_unconfigured"
 
 
 @time_trigger("startup")
@@ -2220,7 +2222,7 @@ async def solis_octopus_startup():
     await reconcile("startup")
 
 
-@state_trigger(*EV_TRIGGER_ENTITIES)
+@state_trigger(EV_T1, EV_T2, EV_T3)
 async def solis_octopus_ev_changed(var_name=None, value=None, old_value=None):
     charging, _ = car_charging()
     if not EV_ENABLED or charging == _ev["last_charging"]:

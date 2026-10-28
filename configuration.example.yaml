@@ -1,0 +1,104 @@
+# Add to configuration.yaml, then restart Home Assistant.
+# Copy pyscript/apps/solis_octopus.py to <config>/pyscript/apps/solis_octopus.py
+#
+# This replaces the solis_ev_follow, octopus_happy_hour and solis_power_down
+# apps: remove their blocks and files. cosy_wc_tuner is separate and can stay
+# in the same pyscript: block.
+
+pyscript:
+  hass_is_global: true
+  allow_all_imports: true
+  apps:
+    solis_octopus:
+      # --- SolisCloud (the same secrets as before) ---
+      key_id: !secret solis_key_id
+      secret: !secret solis_secret
+      username: !secret solis_username
+      password: !secret solis_password
+      plantId: !secret solis_plant_id
+      # inverter_sn: !secret solis_inverter_sn   # only needed with multiple inverters
+
+      inverter_timezone: Europe/London
+      core_window: "23:30-05:30"   # Octopus cheap overnight window
+      notify_service: notify.mobile_app_your_phone   # or a list of several
+      # notify_data: {push: {interruption-level: time-sensitive}}
+
+      # Start with this on: logs what it *would* write, boost and run, without doing it.
+      diagnostics_only: true
+
+      # --- Which Solis slots each feature uses ---
+      slots:
+        core: 1                 # charge slot: core overnight window
+        ev: 2                   # charge slot: EV-Follow
+        happy_hour: 3           # charge slot: happy hours / power ups
+        export: 1               # discharge slot: Power Down / peak export
+        clear_other_charge_slots: false   # clear unused charge slots once at startup
+
+      # --- Battery and export prediction ---
+      battery:
+        soc_sensor: sensor.solis_remaining_battery_capacity
+        capacity_kwh: 16.1
+        floor_soc: 10           # never discharge below this
+        core_charge_soc: 100    # SOC reached by the end of the cheap window
+        load_power_sensor: sensor.solis_house_load   # needs long-term statistics
+        history_days: 14
+        default_load_kw: 0.5
+        reserve_margin: 1.2     # keep 20% extra for the evening
+        # solar_forecast_sensors:
+        #   - sensor.solcast_pv_forecast_forecast_today
+        #   - sensor.solcast_pv_forecast_forecast_tomorrow
+        # voltage_sensor: sensor.solis_battery_voltage
+        voltage: 51.2
+        max_discharge_kw: 5.0
+        max_discharge_amps: 100
+        export_limit_kw: 3.68   # your DNO export limit
+        discharge_efficiency: 0.95
+        min_export_kw: 0.2      # don't force a discharge that would barely export
+        current_step_amps: 5
+        prepare_minutes: 15     # write the discharge slot this long before a window
+
+      # --- EV-Follow: charge the battery while the car is smart-charging ---
+      ev_follow:
+        dispatch_sensor: binary_sensor.octopus_energy_XXXXXXXX_intelligent_dispatching
+        charger_switch: switch.hypervolt_charging
+        charger_current: sensor.hypervolt_charger_current
+        min_current_amps: 3
+        debounce_seconds: 60
+        extend_lead_minutes: 3
+        manage_core_slot: true
+
+      # --- Happy Hour / Power Up: free electricity ---
+      happy_hour:
+        power_up_events_entity: event.octopus_energy_a_XXXXXXXX_octoplus_power_up_events
+        auto_join: false
+        join_selection: earliest
+        charge_current: 100
+        charge_soc: 100
+        prepare_minutes: 5
+        heat_pump_id: 00_1e_5e_09_02_ab_cd
+        hot_water_temperature: 50
+        # start_actions:
+        #   - service: switch.turn_on
+        #     target: {entity_id: switch.hypervolt_charging}
+        # end_actions:
+        #   - service: switch.turn_off
+        #     target: {entity_id: switch.hypervolt_charging}
+
+      # --- Octopus Power Down ---
+      power_down:
+        power_down_events_entity: event.octopus_energy_a_XXXXXXXX_octoplus_power_down_events
+        auto_join: true
+
+      # --- Daily peak export ---
+      peak_export:
+        window: "16:00-19:00"
+        rate: 16                # p/kWh, only used for the value estimate
+        # switch: input_boolean.solis_peak_export   # turn off to skip a day
+        notify: false
+
+      # --- Axle Energy (top priority; the app stays off the inverter during events) ---
+      axle:
+        grace_minutes: 10
+        # event_type_sensor: sensor.axle_energy_event_type
+        # event_start_sensor: sensor.axle_energy_event_start
+        # event_end_sensor: sensor.axle_energy_event_end

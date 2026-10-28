@@ -275,9 +275,9 @@ class FakeSolisCloud:
 # The loaded app
 # -----------------------------
 class App:
-    def __init__(self, config=None, *more, started=True):
+    def __init__(self, config=None, *more, started=True, raw=None):
         _install_homeassistant_stub()
-        cfg = build_config(config, *more)
+        cfg = raw if raw is not None else build_config(config, *more)
 
         self.states = {}
         self.state_sets = []
