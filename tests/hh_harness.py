@@ -20,7 +20,7 @@ HH_KEYS = {
     "power_up_events_entity", "weekend_happy_hours_entity", "auto_join", "join_selection",
     "battery_charge", "charge_current", "charge_soc", "prepare_minutes", "heat_pump_id",
     "water_heater_entity", "hot_water_boost", "hot_water_temperature", "start_actions",
-    "end_actions", "notify_scheduled", "notify_end",
+    "end_actions", "notify_scheduled", "notify_end", "power_up_calendar", "calendar_refresh_minutes",
 }
 
 BASE = {
