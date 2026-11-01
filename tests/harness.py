@@ -173,18 +173,11 @@ class FakeServices:
     def __init__(self):
         self.calls = []
         self.fail = set()
-        self.responses = {}  # (domain, service) -> response, or a function of the call
 
-    async def async_call(self, domain, service, data=None, blocking=False, target=None,
-                         return_response=False):
-        call = {"domain": domain, "service": service, "data": data or {}, "target": target}
-        self.calls.append(call)
+    async def async_call(self, domain, service, data=None, blocking=False, target=None):
+        self.calls.append({"domain": domain, "service": service, "data": data or {}, "target": target})
         if (domain, service) in self.fail:
             raise RuntimeError("service failed")
-        if return_response:
-            response = self.responses.get((domain, service))
-            return response(call) if callable(response) else response
-        return None
 
     def joins(self):
         return [c["data"]["event_code"] for c in self.calls
@@ -205,7 +198,7 @@ class FakeServices:
 
     def others(self):
         return [(c["domain"], c["service"]) for c in self.calls
-                if c["domain"] not in ("notify", "octopus_energy", "calendar")]
+                if c["domain"] not in ("notify", "octopus_energy")]
 
 
 # -----------------------------

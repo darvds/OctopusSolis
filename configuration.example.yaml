@@ -69,9 +69,7 @@ pyscript:
 
       # --- Happy Hour / Power Up: free electricity ---
       happy_hour:
-        # Booked happy hours / power ups. Enable this calendar in the Octopus integration first.
-        power_up_calendar: calendar.octopus_energy_a_XXXXXXXX_octoplus_power_up
-        # power_up_events_entity is derived from it; it's only needed (and must be enabled) for auto_join.
+        power_up_events_entity: event.octopus_energy_a_XXXXXXXX_octoplus_power_up_events
         auto_join: false
         join_selection: earliest
         charge_current: 100

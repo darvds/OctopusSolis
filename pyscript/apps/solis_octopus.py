@@ -49,7 +49,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 log = logging.getLogger("pyscript.solis_octopus")
 log.setLevel(logging.DEBUG)
 
-VERSION = "1.3.0"
+VERSION = "1.2.0"
 
 # -----------------------------
 # SolisCloud endpoints / constants
@@ -218,23 +218,11 @@ MANAGE_CORE_SLOT = _cfg_bool("manage_core_slot", True, EVC) and EV_ENABLED
 
 # --- Happy Hour / Power Up ---
 HH_ENABLED = _cfg_bool("enabled", bool(HHC), HHC)
-# Booked happy hours come from the power up calendar (and the events entity,
-# if it's enabled). Either one gives the account, so the other entities can be
-# derived from it.
-_hh_cal_cfg = str(HHC.get("power_up_calendar", ""))
-_hh_events_cfg = str(HHC.get("power_up_events_entity", ""))
-_m = (re.match(r"^calendar\.octopus_energy_(.+)_octoplus_power_up$", _hh_cal_cfg)
-      or re.match(r"^event\.octopus_energy_(.+)_octoplus_power_up_events$", _hh_events_cfg))
-_hh_account = _m.group(1) if _m else ""
-HH_CALENDAR = (_hh_cal_cfg or (f"calendar.octopus_energy_{_hh_account}_octoplus_power_up" if _hh_account else "")) \
-    if HH_ENABLED else ""
-HH_EVENTS_ENTITY = (_hh_events_cfg or (f"event.octopus_energy_{_hh_account}_octoplus_power_up_events"
-                                       if _hh_account else "")) if HH_ENABLED else ""
-# sensor.octopus_energy_<account>_octoplus_weekend_happy_hours
+HH_EVENTS_ENTITY = str(HHC.get("power_up_events_entity", "")) if HH_ENABLED else ""
+# sensor.octopus_energy_<account>_octoplus_weekend_happy_hours, derived from the events entity.
+_m = re.match(r"^event\.octopus_energy_(.+)_octoplus_power_up_events$", HH_EVENTS_ENTITY)
 HH_TOKENS_ENTITY = str(HHC.get("weekend_happy_hours_entity",
-                               f"sensor.octopus_energy_{_hh_account}_octoplus_weekend_happy_hours"
-                               if _hh_account else ""))
-HH_CALENDAR_REFRESH_MINUTES = int(HHC.get("calendar_refresh_minutes", 5))
+                               f"sensor.octopus_energy_{_m.group(1)}_octoplus_weekend_happy_hours" if _m else ""))
 HH_AUTO_JOIN = _cfg_bool("auto_join", False, HHC)
 HH_JOIN_SELECTION = str(HHC.get("join_selection", "earliest")).lower()
 HH_BATTERY_CHARGE = _cfg_bool("battery_charge", True, HHC) and HH_ENABLED
@@ -366,8 +354,6 @@ _pd_joined = {"by_us": {}, "notified": set()}
 _hh_joined = {"by_us": {}, "failed_at": {}}
 # Happy hour windows we've announced, and the ones running (id -> record).
 _hh_seen = {"announced": set(), "running": {}}
-# Booked happy hours read from the power up calendar with calendar.get_events.
-_hh_cal = {"sessions": [], "fetched_at": None, "dirty": True, "ok": None}
 # EV-Follow: the programmed EV window as datetimes, and when charging was first seen.
 _ev = {"start": None, "end": None, "charging_since": None, "debounced": False, "last_charging": None,
        "info": {}}
@@ -1390,102 +1376,20 @@ def hh_session_from_event(ev):
     }
 
 
-def _ha_tz():
-    try:
-        return ZoneInfo(hass.config.time_zone or INVERTER_TIMEZONE)
-    except Exception:
-        return INV_TZ
-
-
-def _ha_local_dt(value):
-    """
-    A calendar time -> aware datetime. Calendar attributes are "YYYY-MM-DD HH:MM:SS"
-    in HA's local time; calendar.get_events gives ISO times with an offset.
-    """
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        dt = value
-    else:
-        try:
-            dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
-        except ValueError:
-            return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=_ha_tz())
-    return dt
-
-
-def _cal_session(start, end):
-    if start is None or end is None or end <= start:
-        return None
-    return {"id": f"cal:{start.astimezone(timezone.utc).isoformat()}", "code": None,
-            "start": start, "end": end, "availability": ""}
-
-
-def hh_calendar_sessions():
-    """Booked happy hours from the power up calendar: its current/next event, plus get_events."""
-    out = list(_hh_cal["sessions"])
-    attrs = _attrs(HH_CALENDAR)
-    s = _cal_session(_ha_local_dt(attrs.get("start_time")), _ha_local_dt(attrs.get("end_time")))
-    if s is not None:
-        out.append(s)
-    return out
-
-
-async def hh_refresh_calendar(now, force=False):
-    """Read the power up calendar's events for the next week (every few minutes, or when it changes)."""
-    if not HH_CALENDAR or hass.states.get(HH_CALENDAR) is None:
-        return
-    last = _hh_cal["fetched_at"]
-    if not force and not _hh_cal["dirty"] and last is not None \
-            and now - last < timedelta(minutes=HH_CALENDAR_REFRESH_MINUTES):
-        return
-    _hh_cal["fetched_at"], _hh_cal["dirty"] = now, False
-    data = {"start_date_time": (now - timedelta(days=1)).isoformat(),
-            "end_date_time": (now + timedelta(days=7)).isoformat()}
-    try:
-        resp = await hass.services.async_call("calendar", "get_events", data, blocking=True,
-                                              return_response=True, target={"entity_id": HH_CALENDAR})
-    except Exception as e:
-        if _hh_cal["ok"] is not False:
-            log.warning("Reading %s with calendar.get_events failed: %s (using its current/next event)",
-                        HH_CALENDAR, e)
-        _hh_cal["ok"] = False
-        return
-    events = ((resp or {}).get(HH_CALENDAR) or {}).get("events") or []
-    sessions = []
-    for ev in events:
-        if isinstance(ev, dict):
-            s = _cal_session(_ha_local_dt(ev.get("start")), _ha_local_dt(ev.get("end")))
-            if s is not None:
-                sessions.append(s)
-    _hh_cal["sessions"], _hh_cal["ok"] = sessions, True
-
-
 def hh_sessions():
-    """(booked, available) sessions from the power up calendar and events entity."""
+    """(booked, available) sessions from the power up events entity."""
     attrs = _attrs(HH_EVENTS_ENTITY)
     booked = []
     seen = set()
-    spans = set()
-
-    def add(s):
-        span = (s["start"].timestamp(), s["end"].timestamp())
-        if s["id"] in seen or span in spans:
-            return
-        booked.append(s)
-        seen.add(s["id"])
-        spans.add(span)
-
     for ev in attrs.get("events") or []:
         s = hh_session_from_event(ev)
         if s is not None:
-            add(s)
-    for s in hh_calendar_sessions():
-        add(s)
-    for s in _hh_joined["by_us"].values():
-        add(s)
+            booked.append(s)
+            seen.add(s["id"])
+    for sid, s in _hh_joined["by_us"].items():
+        if sid not in seen:
+            booked.append(s)
+            seen.add(sid)
 
     available = []
     for ev in attrs.get("available_events") or []:
@@ -1528,23 +1432,21 @@ def is_running(window, now):
 
 
 def hh_events_status():
-    """"ok" (the calendar or events entity exists), "not_configured" or "missing"."""
-    if not HH_EVENTS_ENTITY and not HH_CALENDAR:
+    """"ok", "not_configured" or "missing" for the power up events entity."""
+    if not HH_EVENTS_ENTITY:
         return "not_configured"
-    for entity in (HH_CALENDAR, HH_EVENTS_ENTITY):
-        if entity and hass.states.get(entity) is not None:
-            return "ok"
-    return "missing"
+    if hass.states.get(HH_EVENTS_ENTITY) is None:
+        return "missing"
+    return "ok"
 
 
 def hh_events_warning(status):
     if status == "missing":
-        return (f"Neither the power up calendar '{HH_CALENDAR}' nor the power up events entity "
-                f"'{HH_EVENTS_ENTITY}' exists, so happy hours are ignored. Both are disabled by default "
-                f"in the Octopus integration: enable the calendar, then check power_up_calendar against "
+        return (f"Power up events entity '{HH_EVENTS_ENTITY}' doesn't exist, so happy hours are ignored. "
+                f"It's disabled by default: enable it, then check power_up_events_entity against "
                 f"Developer Tools -> States.")
     if status == "not_configured":
-        return "power_up_calendar isn't set, so happy hours are ignored."
+        return "power_up_events_entity isn't set, so happy hours are ignored."
     return None
 
 
@@ -1571,7 +1473,7 @@ def tokens_available():
 
 async def hh_auto_join():
     """Book one available weekend happy hour (earliest or latest) if there's a token for it."""
-    if not HH_AUTO_JOIN or not HH_EVENTS_ENTITY or hass.states.get(HH_EVENTS_ENTITY) is None:
+    if not HH_AUTO_JOIN or hh_events_status() != "ok":
         return
     tokens = tokens_available()
     if tokens is not None and tokens < 1:
@@ -2161,8 +2063,6 @@ async def _reconcile(reason):
 
     # What each feature wants.
     ev_want, ev_info, ev_on = plan_ev(now)
-    if HH_ENABLED:
-        await hh_refresh_calendar(now)
     hh_windows = happy_hours() if HH_ENABLED else []
     hh_window = hh_target_window(hh_windows, now)
     hh_want = hh_desired(hh_window, now)
@@ -2389,8 +2289,6 @@ def publish_hh_status(window, windows, now, events_status):
         "car_schedule": car_status(),
         "last_reason": _flags["last_reason"],
         "power_up_events": events_status,
-        "power_up_calendar": HH_CALENDAR or None,
-        "calendar_read_ok": _hh_cal["ok"],
         "diagnostics_only": DIAGNOSTICS_ONLY,
         "version": VERSION,
         "last_updated": datetime.now(timezone.utc).isoformat(),
@@ -2495,12 +2393,9 @@ async def solis_octopus_startup():
     if PD_ENABLED and (not PD_EVENTS_ENTITY or hass.states.get(PD_EVENTS_ENTITY) is None):
         log.warning("Power down events entity '%s' not found yet - check power_down.power_down_events_entity",
                     PD_EVENTS_ENTITY)
-    if HH_ENABLED and hh_events_status() != "ok":
-        log.warning("Power up calendar '%s' not found yet - check happy_hour.power_up_calendar "
-                    "(it's disabled by default in the Octopus integration)", HH_CALENDAR)
-    if HH_AUTO_JOIN and (not HH_EVENTS_ENTITY or hass.states.get(HH_EVENTS_ENTITY) is None):
-        log.warning("auto_join needs the power up events entity '%s' (disabled by default in the Octopus "
-                    "integration); weekend happy hours won't be booked", HH_EVENTS_ENTITY)
+    if HH_ENABLED and (not HH_EVENTS_ENTITY or hass.states.get(HH_EVENTS_ENTITY) is None):
+        log.warning("Power up events entity '%s' not found yet - check happy_hour.power_up_events_entity "
+                    "(it's disabled by default in the Octopus integration)", HH_EVENTS_ENTITY)
     if HOT_WATER_BOOST and hass.states.get(WATER_HEATER) is None:
         log.warning("Water heater '%s' not found yet - check happy_hour.heat_pump_id / water_heater_entity",
                     WATER_HEATER)
@@ -2509,7 +2404,6 @@ async def solis_octopus_startup():
     # Let the Octopus / Solis / Axle integrations finish loading.
     await asyncio.sleep(STARTUP_DELAY_SECONDS)
     if HH_ENABLED:
-        await hh_refresh_calendar(now_local(), force=True)
         hh_seed(now_local())
     await log_storage_mode()
     await pd_auto_join()
@@ -2555,13 +2449,6 @@ async def solis_octopus_happy_hour_changed(entity_id=None, **kwargs):
     task.unique("solis_octopus_happy_hour", kill_me=True)
     await hh_auto_join()
     await reconcile("happy hour events changed")
-
-
-@event_trigger("state_changed", f"entity_id == '{HH_CALENDAR}'")
-async def solis_octopus_happy_hour_calendar_changed(entity_id=None, **kwargs):
-    task.unique("solis_octopus_happy_hour_calendar", kill_me=True)
-    _hh_cal["dirty"] = True
-    await reconcile("happy hour calendar changed")
 
 
 @event_trigger("state_changed", "entity_id in " + repr(AXLE_SENSORS))
@@ -2635,7 +2522,6 @@ async def solis_octopus_preview():
                               drain_to_floor=axle_dispatch(export_window) and not AXLE_KEEP_RESERVE)
         log.info("Preview export %s: %s", fmt_window(export_window["start"], export_window["end"]), plan)
     if HH_ENABLED:
-        await hh_refresh_calendar(now, force=True)
         windows = happy_hours()
         _, hh_available = hh_sessions()
         window = hh_target_window(windows, now)

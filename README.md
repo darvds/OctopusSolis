@@ -107,7 +107,7 @@ The car's current schedule shows in the `car_schedule` attribute of `sensor.octo
   - SolisCloud API access
 - The [Octopus Energy integration](https://github.com/BottlecapDave/HomeAssistant-OctopusEnergy):
   - **EV-Follow:** the intelligent dispatching sensor set to "started dispatches only".
-  - **Happy Hour:** the **Octoplus Power Up calendar** (`calendar.octopus_energy_<account>_octoplus_power_up`) **enabled**. It's disabled by default. For `auto_join` the power up events entity has to be enabled too.
+  - **Happy Hour:** the power up events entity **enabled**. It's disabled by default.
   - **Power Down:** Octoplus enrolment.
 - For Axle: the Axle Energy integration.
 - For the prediction: a house load sensor with long-term statistics, and a battery SOC sensor.
@@ -198,9 +198,7 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 
 | Option | Default | Description |
 |---|---|---|
-| `power_up_calendar` | **required** (or `power_up_events_entity`) | `calendar.octopus_energy_<account>_octoplus_power_up`. Booked happy hours are read from it. |
-| `power_up_events_entity` | derived | `event.octopus_energy_<account>_octoplus_power_up_events`. Only needed for `auto_join`; booked sessions in it are used too |
-| `calendar_refresh_minutes` | `5` | How often the calendar's upcoming events are re-read (it's also re-read whenever it changes) |
+| `power_up_events_entity` | **required** | `event.octopus_energy_<account>_octoplus_power_up_events` |
 | `weekend_happy_hours_entity` | derived | Token count sensor |
 | `auto_join` | `false` | Book available Weekend Happy Hours while you have tokens |
 | `join_selection` | `earliest` | `earliest` or `latest` |
@@ -263,7 +261,7 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 - **`sensor.solis_power_down`** (+ `_active`): the export plan.
   - **States:** `planned`, `armed`, `exporting`, `paused`, `no_spare_energy`, `axle_upcoming`, `axle_event`.
   - **Attributes:** the prediction, `held_for_power_down_kwh`, `estimated_export_value_pence`, and `power_down_events` / `axle_events` health.
-- **`sensor.octopus_happy_hour`** (+ `_active`): booked happy hours, tokens, the charge slot, the boost, the car schedule (with `renault:`), `power_up_calendar` and `power_up_events` health.
+- **`sensor.octopus_happy_hour`** (+ `_active`): booked happy hours, tokens, the charge slot, the boost, the car schedule (with `renault:`) and `power_up_events` health.
   - With `renault:`, the `car_schedule` attribute has `mode`, `window`, `in_sync` and `failures`.
 - **`sensor.solis_ev_charge_slot`**: the EV slot, charger amps and dispatch state.
 - **Actions** (Developer Tools → Actions):
@@ -279,7 +277,6 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 
 ## Troubleshooting
 
-- **Happy hours are ignored.** Check `power_up_events` on `sensor.octopus_happy_hour`. If it's `missing`, enable the Octoplus Power Up calendar in the Octopus integration (Settings → Devices & services → Octopus Energy → entities). Then set `power_up_calendar` to its entity ID from Developer Tools → States.
 - **A feature isn't doing anything.** Check the `features` attribute on `sensor.solis_octopus`. Then check the `*_events` health attributes on its own sensor. A typo in an entity ID shows as `missing`, with a `warning`.
 - **"Not starting: fix the slots config first".** Two features are set to the same charge slot. The details are in `slot_problems` on `sensor.solis_octopus`.
 - **Slots at the wrong times.** Check the inverter clock and `inverter_timezone`.
