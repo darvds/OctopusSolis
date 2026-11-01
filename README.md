@@ -39,6 +39,8 @@ Before an Axle export event or a Power Down session, earlier export windows **ho
 
 **Happy Hour / Power Up (charge slot 3).** Booked sessions, plus Weekend Happy Hours booked automatically if `auto_join` is on, are charged at `charge_current` up to `charge_soc`. When one starts, the Cosy hot water is boosted, your `start_actions` run and you get a notification. `end_actions` run when it ends.
 
+**Renault car charge schedule (optional).** With a `renault:` section, the car's charge schedule is moved into each happy hour, `prepare_minutes` (10) before it starts, so the car charges on the free electricity. When the happy hour ends, or is cancelled, the schedule goes back to `normal_window` (`23:30-05:30` by default). See [Renault](#renault).
+
 **Export (discharge slot 1).** Power Down sessions (joined automatically) and the daily peak window. For each window the app predicts:
 - house load, from your load sensor's history at that time of day
 - solar, from an optional Solcast forecast
@@ -74,6 +76,27 @@ In both modes Axle pays the same way: it credits *"whatever you export to the gr
 **With `control: false` (Events Only)**, the app holds battery back before export events and makes no inverter writes during any Axle event plus `grace_minutes`. The one exception is switching off one of its own slots that would otherwise still be running.
 
 > **Match the app to your Axle mode.** Never set `control: true` while Axle is still in Events Only, or both will drive the battery. Switch Axle to Self-Dispatch first (Axle account → Settings), then set `control: true`. Axle advises against switching modes often.
+
+## Renault
+
+The app sets the car's charge schedule with the Renault integration's `renault.charge_set_schedules` action:
+
+- During a happy hour (from `prepare_minutes` before it), the schedule is the happy hour, rounded out to the car's 15-minute steps. Back-to-back happy hours are one schedule.
+- The rest of the time, it's `normal_window`. That's also written once at startup, and again when the clocks change: Renault schedules are in UTC, so 23:30 is `T22:30Z` in summer and `T23:30Z` in winter.
+- The same window is set for every day of the week, in one schedule (`schedule_id`). Other schedules on the car aren't touched.
+- Only changes are sent. A failed write is retried every `retry_minutes`. After 3 failures you get one notification.
+- You're told when the schedule is restored after a happy hour, and the happy hour notifications mention the car.
+
+Set up:
+
+1. Add the [Renault integration](https://www.home-assistant.io/integrations/renault/).
+2. Set the car's charge mode to **schedule mode** (the integration's charge mode select, or the My Renault app). In "always charge" mode the car ignores schedules.
+3. Find the car's **device ID**: Settings → Devices & services → Renault → your car. It's the last part of the page's URL (`/config/devices/device/<device id>`). Put it in `renault: vehicle`.
+4. Check which schedule number your normal 23:30-05:30 schedule is (usually 1), and set `schedule_id` if it isn't.
+
+Your charger has to let the car charge during the happy hour too. If Octopus controls it (Intelligent Octopus), you may need a `start_actions` entry to turn it on, like the commented example in [`configuration.example.yaml`](configuration.example.yaml).
+
+The car's current schedule shows in the `car_schedule` attribute of `sensor.octopus_happy_hour`.
 
 ## Requirements
 
@@ -187,6 +210,18 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 | `start_actions`, `end_actions` | none | HA actions to run |
 | `notify_scheduled`, `notify_end` | `true`, `true` | Notify on booking and at the end |
 
+**`renault:`**
+
+| Option | Default | Description |
+|---|---|---|
+| `vehicle` | **required** | The car's device ID in the Renault integration |
+| `name` | `Car` | Used in logs and notifications, e.g. `Renault 5` |
+| `schedule_id` | `1` | The car's charge schedule to rewrite |
+| `normal_window` | `core_window` | Schedule outside happy hours |
+| `prepare_minutes` | `10` | Move the schedule this long before a happy hour |
+| `retry_minutes` | `5` | Wait between retries after a failed write |
+| `notify` | `true` | Notify when the schedule is restored, and when it can't be set |
+
 **`power_down:`**
 
 | Option | Default | Description |
@@ -226,7 +261,8 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 - **`sensor.solis_power_down`** (+ `_active`): the export plan.
   - **States:** `planned`, `armed`, `exporting`, `paused`, `no_spare_energy`, `axle_upcoming`, `axle_event`.
   - **Attributes:** the prediction, `held_for_power_down_kwh`, `estimated_export_value_pence`, and `power_down_events` / `axle_events` health.
-- **`sensor.octopus_happy_hour`** (+ `_active`): booked happy hours, tokens, the charge slot, the boost, and `power_up_events` health.
+- **`sensor.octopus_happy_hour`** (+ `_active`): booked happy hours, tokens, the charge slot, the boost, the car schedule (with `renault:`) and `power_up_events` health.
+  - With `renault:`, the `car_schedule` attribute has `mode`, `window`, `in_sync` and `failures`.
 - **`sensor.solis_ev_charge_slot`**: the EV slot, charger amps and dispatch state.
 - **Actions** (Developer Tools → Actions):
   - `pyscript.solis_octopus_reconcile`: join sessions and re-plan now.

@@ -228,7 +228,9 @@ class OverviewTests(unittest.TestCase):
         self.assertEqual(value, "idle")
         self.assertEqual(set(attrs["slots"]), {"core", "ev", "happy_hour", "export"})
         self.assertEqual(attrs["slots"]["core"]["window"], "23:30-05:30")
-        self.assertTrue(all(attrs["features"].values()))
+        features = dict(attrs["features"])
+        self.assertFalse(features.pop("renault"))  # not in all_app(): it's covered in test_renault
+        self.assertTrue(all(features.values()))
 
 
 if __name__ == "__main__":

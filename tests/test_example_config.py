@@ -27,12 +27,14 @@ class ExampleConfigTests(unittest.TestCase):
         self.assertEqual(app.SLOT_PROBLEMS, [])
         self.assertTrue(app.INVERTER_CONTROL)
         for flag in ("EV_ENABLED", "HH_ENABLED", "PD_ENABLED", "PEAK_EXPORT", "AXLE_EVENTS",
-                     "HH_BATTERY_CHARGE", "HOT_WATER_BOOST", "MANAGE_CORE_SLOT", "DIAGNOSTICS_ONLY"):
+                     "HH_BATTERY_CHARGE", "HOT_WATER_BOOST", "MANAGE_CORE_SLOT", "DIAGNOSTICS_ONLY",
+                     "RENAULT_ENABLED"):
             self.assertTrue(app.g[flag], flag)
         self.assertEqual(app.active_slot_keys(), ["core", "ev", "happy_hour", "export"])
         self.assertEqual(app.BATTERY_CAPACITY_KWH, 16.1)
         self.assertEqual(app.FLOOR_SOC, 10)
         self.assertEqual(app.PEAK_WINDOW, "16:00-19:00")
+        self.assertEqual(app.RENAULT_NORMAL_WINDOW, "23:30-05:30")
 
     def test_reconciles_in_diagnostics_mode(self):
         app = App(raw=load_example())
