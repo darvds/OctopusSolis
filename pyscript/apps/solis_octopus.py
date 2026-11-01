@@ -9,6 +9,8 @@ so features never overwrite each other on the inverter:
   overnight window kept in charge slot 1.
 - Happy Hour: charge at full speed during Octoplus Happy Hours / Power Ups
   (charge slot 3), boost the Cosy hot water, run your start/end actions.
+  Optionally move a Renault car's charge schedule into the happy hour and
+  back to its normal window (e.g. 23:30-05:30) afterwards.
 - Power Down: export during Octoplus Power Down sessions, sized so the battery
   still covers the house until the cheap overnight window (discharge slot 1).
 - Peak export: the same, every day in a peak export window (e.g. 16:00-19:00).
@@ -47,7 +49,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 log = logging.getLogger("pyscript.solis_octopus")
 log.setLevel(logging.DEBUG)
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # -----------------------------
 # SolisCloud endpoints / constants
@@ -113,6 +115,7 @@ PDC = _section("power_down")
 PKC = _section("peak_export")
 AXC = _section("axle")
 SLC = _section("slots")
+RNC = _section("renault")
 
 
 def _as_bool(value):
@@ -261,6 +264,22 @@ AXLE_GRACE_MINUTES = int(AXC.get("grace_minutes", 10))
 AXLE_CONTROL = _cfg_bool("control", False, AXC) and AXLE_EVENTS
 AXLE_KEEP_RESERVE = _cfg_bool("keep_evening_reserve", False, AXC)
 
+# --- Renault car charge schedule (moved into happy hours, back to normal after) ---
+RENAULT_ENABLED = _cfg_bool("enabled", bool(RNC), RNC)
+RENAULT_VEHICLE = str(RNC.get("vehicle", ""))
+RENAULT_NAME = str(RNC.get("name", "Car"))
+RENAULT_SCHEDULE_ID = int(RNC.get("schedule_id", 1))
+RENAULT_NORMAL_WINDOW = str(RNC.get("normal_window", CORE_WINDOW))
+RENAULT_PREPARE_MINUTES = int(RNC.get("prepare_minutes", 10))
+RENAULT_RETRY_MINUTES = int(RNC.get("retry_minutes", 5))
+RENAULT_NOTIFY = _cfg_bool("notify", True, RNC)
+if RENAULT_ENABLED and not RENAULT_VEHICLE:
+    log.error("renault.vehicle (the Renault device ID) isn't set; the car's charge schedule won't be changed")
+    RENAULT_ENABLED = False
+if RENAULT_ENABLED and not HH_ENABLED:
+    log.warning("renault needs the happy_hour section; the car's charge schedule won't be changed")
+    RENAULT_ENABLED = False
+
 _missing_credentials = [k for k in ("key_id", "secret", "username", "password", "plantId") if not CFG.get(k)]
 INVERTER_CONTROL = not _missing_credentials
 if _missing_credentials:
@@ -339,6 +358,10 @@ _hh_seen = {"announced": set(), "running": {}}
 _ev = {"start": None, "end": None, "charging_since": None, "debounced": False, "last_charging": None,
        "info": {}}
 _last = {"plan": None, "export_window": None, "hh_window": None, "decision": None}
+# Renault: the schedule we last set on the car (None = unknown, e.g. after a
+# restart, so it's written), and the retry state for the one we want.
+_car = {"applied": None, "applied_mode": None, "wanted": None, "failed_at": None, "failures": 0,
+        "fail_notified": None, "last_ok": None}
 
 
 # -----------------------------
@@ -1507,6 +1530,8 @@ def hh_plan_summary():
         parts.append(f"battery charging to {HH_CHARGE_SOC}%")
     if HOT_WATER_BOOST:
         parts.append(f"hot water boosting to {HOT_WATER_TEMPERATURE:g}°C")
+    if RENAULT_ENABLED:
+        parts.append(f"{RENAULT_NAME} set to charge")
     if START_ACTIONS:
         parts.append(f"{len(START_ACTIONS)} other action{'s' if len(START_ACTIONS) != 1 else ''}")
     if not parts:
@@ -1632,6 +1657,120 @@ def hh_desired(window, now):
         "current": HH_CHARGE_CURRENT,
         "soc": HH_CHARGE_SOC,
         "enabled": True,
+    }
+
+
+# -----------------------------
+# Renault: move the car's charge schedule into happy hours
+# -----------------------------
+RENAULT_DOMAIN = "renault"
+RENAULT_SERVICE = "charge_set_schedules"
+WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+RENAULT_NORMAL_START, RENAULT_NORMAL_END = _parse_window(RENAULT_NORMAL_WINDOW)
+
+
+def _renault_time(dt):
+    """Renault schedules are in UTC, as "THH:MMZ"."""
+    return dt.astimezone(timezone.utc).strftime("T%H:%MZ")
+
+
+def _floor_quarter(dt):
+    return dt.replace(minute=(dt.minute // 15) * 15, second=0, microsecond=0)
+
+
+def car_happy_schedule(window):
+    """(start, minutes) covering the happy hour, in the car's 15-minute steps."""
+    start = _floor_quarter(window["start"])
+    minutes = int(math.ceil((window["end"] - start).total_seconds() / 60.0 / 15.0)) * 15
+    return start, max(15, minutes)
+
+
+def car_normal_schedule(now):
+    """(start, minutes) of the normal window, using today's UTC offset."""
+    start = _at_local_time(now, RENAULT_NORMAL_START)
+    s = RENAULT_NORMAL_START.hour * 60 + RENAULT_NORMAL_START.minute
+    e = RENAULT_NORMAL_END.hour * 60 + RENAULT_NORMAL_END.minute
+    return start, (e - s) % (24 * 60) or 24 * 60
+
+
+def car_desired(window, now):
+    """("happy_hour" | "normal", start, minutes) the car's schedule should hold now."""
+    if window is not None and window["start"] - timedelta(minutes=RENAULT_PREPARE_MINUTES) <= now < window["end"]:
+        start, minutes = car_happy_schedule(window)
+        return "happy_hour", start, minutes
+    start, minutes = car_normal_schedule(now)
+    return "normal", start, minutes
+
+
+def car_schedule_data(start, minutes):
+    """The renault.charge_set_schedules data: the same window every day of the week."""
+    day = {"startTime": _renault_time(start), "duration": minutes}
+    schedule = {"id": RENAULT_SCHEDULE_ID, "activated": True}
+    for name in WEEKDAYS:
+        schedule[name] = dict(day)
+    return {"vehicle": RENAULT_VEHICLE, "schedules": [schedule]}
+
+
+def car_window_text(start, minutes):
+    return fmt_window(start, start + timedelta(minutes=minutes))
+
+
+async def car_schedule_sync(window, now):
+    """
+    Set the car's charge schedule to the happy hour (from prepare_minutes before
+    it) and back to the normal window when it's over. Only changes are sent.
+    A failed write is retried every retry_minutes.
+    """
+    mode, start, minutes = car_desired(window, now)
+    key = f"{_renault_time(start)}/{minutes}"
+    if key == _car["applied"]:
+        return
+    if _car["wanted"] != key:
+        _car["wanted"], _car["failed_at"], _car["failures"] = key, None, 0
+    if _car["failed_at"] is not None and now - _car["failed_at"] < timedelta(minutes=RENAULT_RETRY_MINUTES):
+        return
+
+    text = car_window_text(start, minutes)
+    data = car_schedule_data(start, minutes)
+    label = "the happy hour" if mode == "happy_hour" else "its normal time"
+    if DIAGNOSTICS_ONLY:
+        log.warning("DIAGNOSTICS MODE: would call %s.%s with %s (%s charging %s)",
+                    RENAULT_DOMAIN, RENAULT_SERVICE, data, RENAULT_NAME, text)
+    else:
+        log.info("Setting %s charge schedule %s to %s (%s)", RENAULT_NAME, RENAULT_SCHEDULE_ID, text, label)
+        try:
+            await hass.services.async_call(RENAULT_DOMAIN, RENAULT_SERVICE, data, blocking=True)
+        except Exception as e:
+            _car["failed_at"] = now
+            _car["failures"] += 1
+            log.error("Setting %s charge schedule to %s failed: %s (retrying in %s min)",
+                      RENAULT_NAME, text, e, RENAULT_RETRY_MINUTES)
+            if RENAULT_NOTIFY and _car["failures"] >= 3 and _car["fail_notified"] != key:
+                _car["fail_notified"] = key
+                await notify(f"{RENAULT_NAME} schedule not set",
+                             f"Couldn't set the charge schedule to {text} ({label}). Still retrying.")
+            return
+    previous = _car["applied_mode"]
+    _car["applied"], _car["applied_mode"] = key, mode
+    _car["failed_at"], _car["failures"], _car["last_ok"] = None, 0, now
+    if RENAULT_NOTIFY and mode == "normal" and previous == "happy_hour":
+        await notify(f"{RENAULT_NAME} schedule restored",
+                     f"Charging back to {text}.{_diag_suffix()}")
+
+
+def car_status():
+    if not RENAULT_ENABLED:
+        return None
+    mode, start, minutes = car_desired(_last["hh_window"], now_local())
+    return {
+        "vehicle": RENAULT_VEHICLE,
+        "schedule_id": RENAULT_SCHEDULE_ID,
+        "mode": _car["applied_mode"],
+        "wanted": mode,
+        "window": car_window_text(start, minutes),
+        "in_sync": _car["applied"] == f"{_renault_time(start)}/{minutes}",
+        "failures": _car["failures"],
+        "last_set": _car["last_ok"].isoformat() if _car["last_ok"] else None,
     }
 
 
@@ -1998,6 +2137,8 @@ async def _reconcile(reason):
         await hh_finish_ended(hh_windows, now)
         if is_running(hh_window, now):
             await hh_start_window(hh_window, now)
+    if RENAULT_ENABLED:
+        await car_schedule_sync(hh_window, now)
 
     _last["plan"] = plan
     _last["export_window"] = export_window
@@ -2067,7 +2208,8 @@ def publish_overview(now, export_window, hh_window):
         "decision": _last["decision"],
         "slots": slots,
         "features": {"ev_follow": EV_ENABLED, "happy_hour": HH_ENABLED, "power_down": PD_ENABLED,
-                     "peak_export": PEAK_EXPORT, "axle": AXLE_EVENTS},
+                     "peak_export": PEAK_EXPORT, "axle": AXLE_EVENTS,
+                     "renault": RENAULT_ENABLED},
         "slot_problems": SLOT_PROBLEMS or None,
         "last_reason": _flags["last_reason"],
         "last_write_ok": _flags["last_write_ok"],
@@ -2144,6 +2286,7 @@ def publish_hh_status(window, windows, now, events_status):
         "boost_until": rec["boost_until"].isoformat() if rec and rec["boost_until"] else None,
         "start_actions": len(START_ACTIONS),
         "end_actions": len(END_ACTIONS),
+        "car_schedule": car_status(),
         "last_reason": _flags["last_reason"],
         "power_up_events": events_status,
         "diagnostics_only": DIAGNOSTICS_ONLY,
@@ -2238,10 +2381,10 @@ else:
 @time_trigger("startup")
 async def solis_octopus_startup():
     log.info("=== Solis Octopus v%s starting (ev_follow=%s, happy_hour=%s, power_down=%s, "
-             "peak_export=%s, axle=%s, tz %s, diagnostics_only=%s) ===", VERSION, EV_ENABLED,
+             "peak_export=%s, axle=%s, renault=%s, tz %s, diagnostics_only=%s) ===", VERSION, EV_ENABLED,
              HH_ENABLED, PD_ENABLED, PEAK_EXPORT,
              ("self-dispatch" if AXLE_CONTROL else "stand aside") if AXLE_EVENTS else False,
-             INVERTER_TIMEZONE, DIAGNOSTICS_ONLY)
+             RENAULT_ENABLED, INVERTER_TIMEZONE, DIAGNOSTICS_ONLY)
     if SLOT_PROBLEMS:
         log.error("Not starting: fix the slots config first (%s)", "; ".join(SLOT_PROBLEMS))
         return
@@ -2401,6 +2544,13 @@ async def solis_octopus_preview():
                      hh_desired(window, window["start"]) if HH_BATTERY_CHARGE else "off",
                      f"{boost_minutes(window, window['start'])} min at {HOT_WATER_TEMPERATURE:g}°C"
                      if HOT_WATER_BOOST else "off", hh_plan_summary())
+        if RENAULT_ENABLED:
+            mode, start, minutes = car_desired(window, now)
+            log.info("Preview %s charge schedule: %s %s now%s", RENAULT_NAME, mode,
+                     car_window_text(start, minutes),
+                     "" if window is None else
+                     f", {car_window_text(*car_happy_schedule(window))} from "
+                     f"{to_local(window['start'] - timedelta(minutes=RENAULT_PREPARE_MINUTES)).strftime('%H:%M')}")
     if EV_ENABLED:
         charging, info = car_charging()
         log.info("Preview EV-Follow: charging=%s %s, programmed %s", charging, info, _slots["ev"]["window"])

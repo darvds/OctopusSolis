@@ -84,6 +84,17 @@ pyscript:
         #   - service: switch.turn_off
         #     target: {entity_id: switch.hypervolt_charging}
 
+      # --- Renault: charge the car in happy hours, then back to the normal time ---
+      # Needs the Renault integration, with the car's charge mode set to schedule mode.
+      renault:
+        vehicle: 0123456789abcdef0123456789abcdef   # the car's device ID (see the README)
+        name: Renault 5
+        schedule_id: 1                # the car's charge schedule this app rewrites
+        normal_window: "23:30-05:30"  # restored after each happy hour (default: core_window)
+        prepare_minutes: 10           # move the schedule this long before the happy hour
+        # retry_minutes: 5
+        # notify: true
+
       # --- Octopus Power Down ---
       power_down:
         power_down_events_entity: event.octopus_energy_a_XXXXXXXX_octoplus_power_down_events
