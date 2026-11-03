@@ -45,7 +45,7 @@ from zoneinfo import ZoneInfo
 log = logging.getLogger("pyscript.solis_octopus")
 log.setLevel(logging.DEBUG)
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 
 # -----------------------------
 # Solis Modbus entities (Grid Time of Use, 6 slots)
@@ -318,7 +318,7 @@ def _empty_program():
 
 _slots = {"core": _empty_program(), "ev": _empty_program(), "happy_hour": _empty_program(),
           "export": _empty_program()}
-_cache = {"prefix": None, "load_profile": None, "load_profile_at": None}
+_cache = {"prefix": None, "entities": {}, "load_profile": None, "load_profile_at": None}
 _flags = {"busy": False, "write_lock": False, "started": False, "last_reason": None,
           "last_write_ok": None, "pd_warned_at": None, "hh_warned_at": None, "axle_warned_at": None,
           "write_batches": 0, "hh_seeded": False, "others_cleared": False}
@@ -372,20 +372,46 @@ def inverter_prefix():
     return "solis"
 
 
+def resolve_entity(domain, prefix, suffix):
+    """
+    "<domain>.<prefix>_<suffix>" if it exists. Otherwise the one entity in the
+    domain whose ID ends in "_<suffix>": Home Assistant keeps an entity's
+    first ID, so entities created by older Solis Modbus versions can be named
+    differently (e.g. switch.<prefix>_solis_grid_time_of_use_charging_period_1).
+    """
+    exact = f"{domain}.{prefix}_{suffix}"
+    if exact in _cache["entities"]:
+        return _cache["entities"][exact]
+    if hass.states.get(exact) is not None:
+        return exact
+    candidates = []
+    for entity_id in _entity_ids(domain):
+        if entity_id.endswith("_" + suffix) or entity_id == f"{domain}.{suffix}":
+            candidates.append(entity_id)
+    if len(candidates) > 1:
+        # Several inverters: keep the ones that look like ours.
+        candidates = [e for e in candidates if e.split(".", 1)[1].startswith(prefix + "_")]
+    if len(candidates) == 1:
+        log.info("Using %s for %s", candidates[0], exact)
+        _cache["entities"][exact] = candidates[0]
+        return candidates[0]
+    return exact
+
+
 def slot_entity_ids(kind, num):
     """((start, end) time entities, current number, SOC number, on/off switch) for one slot."""
     p = inverter_prefix()
     if kind == "charge":
-        return ((f"time.{p}_grid_time_of_use_charge_start_slot_{num}",
-                 f"time.{p}_grid_time_of_use_charge_end_slot_{num}"),
-                f"number.{p}_grid_time_of_use_charge_battery_current_slot_{num}",
-                f"number.{p}_grid_time_of_use_charge_cut_off_soc_slot_{num}",
-                f"switch.{p}_grid_time_of_use_charging_period_{num}")
-    return ((f"time.{p}_grid_time_of_use_discharge_start_slot_{num}",
-             f"time.{p}_grid_time_of_use_discharge_end_slot_{num}"),
-            f"number.{p}_grid_time_of_use_discharge_battery_current_slot_{num}",
-            f"number.{p}_grid_time_of_use_discharge_cut_off_soc_slot_{num}",
-            f"switch.{p}_grid_time_of_use_discharge_period_{num}")
+        names = ("charge_start", "charge_end", "charge_battery_current", "charge_cut_off_soc", "charging_period")
+    else:
+        names = ("discharge_start", "discharge_end", "discharge_battery_current", "discharge_cut_off_soc",
+                 "discharge_period")
+    start, end, current, soc, switch = names
+    return ((resolve_entity("time", p, f"grid_time_of_use_{start}_slot_{num}"),
+             resolve_entity("time", p, f"grid_time_of_use_{end}_slot_{num}")),
+            resolve_entity("number", p, f"grid_time_of_use_{current}_slot_{num}"),
+            resolve_entity("number", p, f"grid_time_of_use_{soc}_slot_{num}"),
+            resolve_entity("switch", p, f"grid_time_of_use_{switch}_{num}"))
 
 
 def _op_entities(op):

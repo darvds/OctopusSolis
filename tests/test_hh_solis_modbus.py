@@ -1,6 +1,6 @@
 import unittest
 
-from tests.harness import PREFIX, charge_slot
+from tests.harness import PREFIX, FakeModbus, charge_slot
 from tests.hh_harness import App, CURRENT, CUTOFF_SOC, SWITCH, TIME
 
 
@@ -82,6 +82,7 @@ class PrefixTests(unittest.TestCase):
 
     def test_prefix_from_config(self):
         app = App({"inverter_prefix": "garage_inverter"})
+        FakeModbus(app.states, prefix="garage_inverter")   # a second inverter
         self.assertEqual(app.slot_entities("happy_hour"), charge_slot(3, prefix="garage_inverter"))
 
     def test_two_inverters_need_a_prefix(self):
@@ -89,6 +90,43 @@ class PrefixTests(unittest.TestCase):
         app.states["time.other_" + "grid_time_of_use_charge_start_slot_1"] = ("00:00:00", {})
         with self.assertLogs("pyscript.solis_octopus", level="ERROR"):
             app.inverter_prefix()
+
+
+class OlderEntityNameTests(unittest.TestCase):
+    """Solis Modbus before 2025-12 named the switches "Solis Grid Time of Use ...", and HA keeps old IDs."""
+
+    def rename_switches(self, app, new_prefix):
+        for n in range(1, 7):
+            for kind in ("charging", "discharge"):
+                old = f"switch.{PREFIX}_grid_time_of_use_{kind}_period_{n}"
+                app.modbus.entities.discard(old)
+                del app.states[old]
+                new = f"switch.{new_prefix}_grid_time_of_use_{kind}_period_{n}"
+                app.states[new] = ("off", {})
+                app.modbus.entities.add(new)
+
+    def test_switches_with_the_old_name_are_found(self):
+        app = App()
+        self.rename_switches(app, f"{PREFIX}_solis")
+        _, _, _, switch = app.slot_entities("happy_hour")
+        self.assertEqual(switch, f"switch.{PREFIX}_solis_grid_time_of_use_charging_period_3")
+        ok = app.run(app.solis_apply([("time", TIME, "14:00-15:00"), ("switch", switch, True)]))
+        self.assertTrue(ok)
+        self.assertEqual(app.states[switch][0], "on")
+
+    def test_switches_without_the_device_prefix_are_found(self):
+        app = App()
+        self.rename_switches(app, "solis")
+        app.g["INVERTER_PREFIX"] = "solis_s6_eh1p"
+        _, _, _, switch = app.slot_entities("export")
+        self.assertEqual(switch, "switch.solis_grid_time_of_use_discharge_period_1")
+
+    def test_another_inverters_switch_is_not_used(self):
+        app = App({"inverter_prefix": "garage"})
+        app.states["switch.house_grid_time_of_use_charging_period_3"] = ("off", {})
+        app.states["switch.garage_x_grid_time_of_use_charging_period_3"] = ("off", {})
+        _, _, _, switch = app.slot_entities("happy_hour")
+        self.assertEqual(switch, "switch.garage_x_grid_time_of_use_charging_period_3")
 
 
 if __name__ == "__main__":

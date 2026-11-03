@@ -112,6 +112,7 @@ The app drives the inverter only through the [Solis Modbus](https://github.com/P
 - Writes use the standard `time.set_value`, `number.set_value` and `switch.turn_on` / `turn_off` actions, one at a time, under one lock.
 - A slot is switched off before it's cleared, and only switched on once its window, current and SOC are written. A failed write stops the batch, so a half-written slot is never switched on. It's retried at the next check.
 - Switches already in the right state aren't written again. Solis Modbus keeps the other slots' on/off bits as they are.
+- Entities created by older Solis Modbus versions keep their old IDs (e.g. `switch.solis_solis_grid_time_of_use_charging_period_1`). When the exact ID isn't there, the app uses the one entity whose ID ends the same way, and logs which one.
 - The prefix comes from the inverter's device name in Solis Modbus. It's found automatically from `time.*_grid_time_of_use_charge_start_slot_1`. With more than one inverter, set `inverter_prefix`.
 - At startup the log says whether every slot entity the app needs was found. The prefix in use shows in the `inverter_prefix` attribute of `sensor.solis_octopus`.
 
