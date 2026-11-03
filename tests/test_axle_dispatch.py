@@ -1,12 +1,12 @@
 """Axle Self-Dispatch (axle.control: true): the app exports during Axle export events itself."""
 import unittest
 
-from tests.harness import (App, CHARGE_SWITCH_CIDS, CHARGE_TIME_CIDS, CURRENT_CID, EV_CONFIG, HH_CONFIG,
-                           SOC_CID, SWITCH_CID, TIME_CID, hh_event, local)
+from tests.harness import (App, CHARGE_SWITCHES, CHARGE_TIMES, EXPORT_CURRENT, EV_CONFIG, HH_CONFIG,
+                           EXPORT_SOC, EXPORT_SWITCH, EXPORT_TIME, hh_event, local)
 
-EV_TIME, EV_SWITCH = CHARGE_TIME_CIDS[1], CHARGE_SWITCH_CIDS[1]
-HH_TIME, HH_SWITCH = CHARGE_TIME_CIDS[2], CHARGE_SWITCH_CIDS[2]
-EV_OFF = [("switch", EV_SWITCH, False), ("value", EV_TIME, "00:00-00:00")]
+EV_TIME, EV_SWITCH = CHARGE_TIMES[1], CHARGE_SWITCHES[1]
+HH_TIME, HH_SWITCH = CHARGE_TIMES[2], CHARGE_SWITCHES[2]
+EV_OFF = [("switch", EV_SWITCH, False), ("time", EV_TIME, "00:00-00:00")]
 
 
 def dispatch_app(axle=None, extra=None, *more, day=6):
@@ -24,8 +24,8 @@ def dispatch_app(axle=None, extra=None, *more, day=6):
 
 
 def arm(window, current, soc):
-    return [("value", TIME_CID, window), ("value", CURRENT_CID, str(current)),
-            ("value", SOC_CID, str(soc)), ("switch", SWITCH_CID, True)]
+    return [("time", EXPORT_TIME, window), ("value", EXPORT_CURRENT, str(current)),
+            ("value", EXPORT_SOC, str(soc)), ("switch", EXPORT_SWITCH, True)]
 
 
 class WindowTests(unittest.TestCase):
@@ -71,7 +71,7 @@ class ExportTests(unittest.TestCase):
         app.ops.clear()
         app.at("18:30")
         app.reconcile()
-        self.assertEqual(app.ops, [[("switch", SWITCH_CID, False), ("value", TIME_CID, "00:00-00:00")]])
+        self.assertEqual(app.ops, [[("switch", EXPORT_SWITCH, False), ("time", EXPORT_TIME, "00:00-00:00")]])
 
     def test_keep_evening_reserve_option(self):
         drain = dispatch_app()
@@ -166,9 +166,9 @@ class PriorityTests(unittest.TestCase):
         app.at("17:15", day=10)
         app.reconcile()
         batch = app.ops[0]
-        self.assertIn(("value", HH_TIME, "17:00-17:30"), batch)
+        self.assertIn(("time", HH_TIME, "17:00-17:30"), batch)
         self.assertNotIn(("switch", HH_SWITCH, False), batch)
-        self.assertIn(("switch", SWITCH_CID, True), batch)
+        self.assertIn(("switch", EXPORT_SWITCH, True), batch)
         self.assertIn("happy hour charging paused: Axle export", app.overview()[2]["decision"])
 
     def test_happy_hour_inside_axle_export_does_not_charge(self):
@@ -190,7 +190,7 @@ class ImportEventTests(unittest.TestCase):
         app.reconcile()
         batch = app.ops[0]
         self.assertIn(("switch", EV_SWITCH, True), batch)
-        self.assertNotIn(SWITCH_CID, [op[1] for op in batch])
+        self.assertNotIn(EXPORT_SWITCH, [op[1] for op in batch])
         self.assertNotIn("standing aside", app.overview()[2]["decision"] or "")
         self.assertEqual(app.status()[2]["axle_event_type"], "import")
 

@@ -1,6 +1,6 @@
 import unittest
 
-from tests.harness import App, EVENTS, TIME_CID, local
+from tests.harness import App, EVENTS, EXPORT_TIME, local
 
 
 def real_joined_events():
@@ -39,7 +39,7 @@ class EventsEntityStatusTests(unittest.TestCase):
         self.assertEqual(attrs["power_down_events"], "missing")
         self.assertIn(EVENTS, attrs["warning"])
         self.assertEqual(attrs["window_kind"], "peak")
-        self.assertEqual(app.ops[0][0], ("value", TIME_CID, "16:00-19:00"))
+        self.assertEqual(app.ops[0][0], ("time", EXPORT_TIME, "16:00-19:00"))
 
     def test_missing_entity_logged_once_an_hour(self):
         app = peak_app()

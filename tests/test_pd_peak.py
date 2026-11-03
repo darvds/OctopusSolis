@@ -1,9 +1,9 @@
 import unittest
 
-from tests.harness import SWITCH_CID, App, CURRENT_CID, SOC_CID, TIME_CID, event, local
+from tests.harness import EXPORT_SWITCH, App, EXPORT_CURRENT, EXPORT_SOC, EXPORT_TIME, event, local
 
 SWITCH = "input_boolean.solis_peak_export"
-CLEAR = [("switch", SWITCH_CID, False), ("value", TIME_CID, "00:00-00:00")]
+CLEAR = [("switch", EXPORT_SWITCH, False), ("time", EXPORT_TIME, "00:00-00:00")]
 
 
 def retarget(window, current, soc):
@@ -12,8 +12,8 @@ def retarget(window, current, soc):
 
 
 def arm(window, current, soc):
-    return [("value", TIME_CID, window), ("value", CURRENT_CID, str(current)),
-            ("value", SOC_CID, str(soc)), ("switch", SWITCH_CID, True)]
+    return [("time", EXPORT_TIME, window), ("value", EXPORT_CURRENT, str(current)),
+            ("value", EXPORT_SOC, str(soc)), ("switch", EXPORT_SWITCH, True)]
 
 
 def peak_app(config=None, joined=()):

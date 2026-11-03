@@ -10,13 +10,12 @@ pyscript:
   allow_all_imports: true
   apps:
     solis_octopus:
-      # --- SolisCloud (the same secrets as before) ---
-      key_id: !secret solis_key_id
-      secret: !secret solis_secret
-      username: !secret solis_username
-      password: !secret solis_password
-      plantId: !secret solis_plant_id
-      # inverter_sn: !secret solis_inverter_sn   # only needed with multiple inverters
+      # --- Solis Modbus (local control, no SolisCloud) ---
+      # The app writes the Solis Modbus integration's "Grid Time of Use" time,
+      # number and switch entities. Their entity ID prefix is found automatically;
+      # set it only with more than one inverter, or if detection fails. For
+      # time.solis_grid_time_of_use_charge_start_slot_1 the prefix is "solis".
+      # inverter_prefix: solis
 
       inverter_timezone: Europe/London
       core_window: "23:30-05:30"   # Octopus cheap overnight window

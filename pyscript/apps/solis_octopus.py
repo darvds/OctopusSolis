@@ -25,58 +25,34 @@ Priority, decided once per pass for all slots together:
     5. Daily peak export.
     6. Core overnight window: always kept.
 
-All SolisCloud traffic goes through one client: one login per pass, one time
-sync a day, and one lock around every write so the slot switch bitmask
-("yuanzhi") is always read and written as a pair.
+All inverter writes go through one place, locally over Modbus via the Solis
+Modbus integration's Home Assistant entities (time, number and switch), with
+one lock around every batch so writes never interleave. Nothing goes through
+SolisCloud.
 
-Requires 6-slot Solis firmware (HMI >= 4B00) with time-of-use (timed
-charge/discharge) enabled, the Octopus Energy integration, and optionally the
-Axle Energy integration.
+Requires the Solis Modbus integration (github.com/Pho3niX90/solis_modbus) on
+a hybrid inverter with "Grid Time of Use" (V2, 6-slot) charge/discharge slots,
+time-of-use enabled, the Octopus Energy integration, and optionally the Axle
+Energy integration.
 """
-import json
 import re
 import math
 import asyncio
 import logging
-import hashlib
-import hmac
-import base64
 from datetime import datetime, timedelta, timezone
-from http import HTTPStatus
 from zoneinfo import ZoneInfo
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 log = logging.getLogger("pyscript.solis_octopus")
 log.setLevel(logging.DEBUG)
 
-VERSION = "1.2.0"
+VERSION = "2.0.0"
 
 # -----------------------------
-# SolisCloud endpoints / constants
+# Solis Modbus entities (Grid Time of Use, 6 slots)
 # -----------------------------
-BASE_URL = "https://www.soliscloud.com:13333"
-VERB = "POST"
-LOGIN_URL = "/v2/api/login"
-CONTROL_URL = "/v2/api/control"
-AT_READ_URL = "/v2/api/atRead"
-AT_READ_BATCH_URL = "/v2/api/atReadBatch"
-INVERTER_LIST_URL = "/v1/api/inverterList"
-
-# 6-slot firmware (HMI >= 4B00) slot CIDs, slot 1..6
-CHARGE_TIME_CIDS = ["5946", "5949", "5952", "5955", "5958", "5961"]
-CHARGE_CURRENT_CIDS = ["5948", "5951", "5954", "5957", "5960", "5963"]
-CHARGE_SOC_CIDS = ["5928", "5929", "5930", "5931", "5932", "5933"]
-DISCHARGE_TIME_CIDS = ["5964", "5968", "5972", "5976", "5980", "5987"]
-DISCHARGE_CURRENT_CIDS = ["5967", "5971", "5975", "5979", "5983", "5986"]
-DISCHARGE_SOC_CIDS = ["5965", "5969", "5973", "5977", "5981", "5984"]
-STORAGE_MODE_CID = "636"
-
-# Per-slot on/off switches ("1"/"0"). Writes must include "yuanzhi": a bitmask
-# of all 12 switch states before the change, bit = index in SLOT_SWITCH_CIDS
-# (charge slots 1-6 -> bits 0-5, discharge slots 1-6 -> bits 6-11).
-CHARGE_SWITCH_CIDS = ["5916", "5917", "5918", "5919", "5920", "5921"]
-DISCHARGE_SWITCH_CIDS = ["5922", "5923", "5924", "5925", "5926", "5927"]
-SLOT_SWITCH_CIDS = CHARGE_SWITCH_CIDS + DISCHARGE_SWITCH_CIDS
+# Entity IDs are "<domain>.<prefix>_<suffix>", where the prefix comes from the
+# inverter's device name in Solis Modbus (e.g. "solis" or "solis_rhi_5k_48es_5g").
+PREFIX_PROBE = "grid_time_of_use_charge_start_slot_1"
 EMPTY_SLOT = "00:00-00:00"
 
 OCTOPUS_DOMAIN = "octopus_energy"
@@ -168,7 +144,8 @@ def _cfg_actions(key, section):
 
 # --- Shared ---
 INVERTER_TIMEZONE = str(CFG.get("inverter_timezone", hass.config.time_zone or "UTC"))
-SYNC_INVERTER_TIME = _cfg_bool("sync_inverter_time", True)
+# Solis Modbus entity ID prefix; found automatically when left out.
+INVERTER_PREFIX = str(CFG.get("inverter_prefix", "") or "").strip().strip("_").lower()
 CORE_WINDOW = str(CFG.get("core_window", "23:30-05:30"))
 NOTIFY_SERVICES = _cfg_list("notify_service")
 NOTIFY_DATA = dict(CFG.get("notify_data") or {})
@@ -280,11 +257,9 @@ if RENAULT_ENABLED and not HH_ENABLED:
     log.warning("renault needs the happy_hour section; the car's charge schedule won't be changed")
     RENAULT_ENABLED = False
 
-_missing_credentials = [k for k in ("key_id", "secret", "username", "password", "plantId") if not CFG.get(k)]
-INVERTER_CONTROL = not _missing_credentials
-if _missing_credentials:
-    log.error("SolisCloud credentials missing (%s); the inverter won't be controlled",
-              ", ".join(_missing_credentials))
+INVERTER_CONTROL = _cfg_bool("inverter_control", True)
+if not INVERTER_CONTROL:
+    log.warning("inverter_control is off; the inverter won't be controlled")
     HH_BATTERY_CHARGE = False
 if HOT_WATER_BOOST and not WATER_HEATER:
     log.error("happy_hour.hot_water_boost needs heat_pump_id or water_heater_entity; hot water boost is off")
@@ -343,11 +318,10 @@ def _empty_program():
 
 _slots = {"core": _empty_program(), "ev": _empty_program(), "happy_hour": _empty_program(),
           "export": _empty_program()}
-_cache = {"inverter_id": None, "inverter_sn": None, "last_time_sync": None,
-          "load_profile": None, "load_profile_at": None}
+_cache = {"prefix": None, "load_profile": None, "load_profile_at": None}
 _flags = {"busy": False, "write_lock": False, "started": False, "last_reason": None,
           "last_write_ok": None, "pd_warned_at": None, "hh_warned_at": None, "axle_warned_at": None,
-          "logins": 0, "hh_seeded": False, "others_cleared": False}
+          "write_batches": 0, "hh_seeded": False, "others_cleared": False}
 # Power Down sessions we joined ourselves (id -> session), and which we've announced.
 _pd_joined = {"by_us": {}, "notified": set()}
 # Happy hours we booked (id -> session) and when a booking last failed (id -> time).
@@ -365,283 +339,158 @@ _car = {"applied": None, "applied_mode": None, "wanted": None, "failed_at": None
 
 
 # -----------------------------
-# SolisCloud client (shared by every feature)
+# Solis Modbus client (shared by every feature)
 # -----------------------------
-def digest(body: str) -> str:
-    return base64.b64encode(hashlib.md5(body.encode("utf-8")).digest()).decode("utf-8")
+def _entity_ids(domain):
+    try:
+        return list(hass.states.async_entity_ids(domain))
+    except Exception:
+        return []
 
 
-def passwordEncode(password: str) -> str:
-    return hashlib.md5(password.encode("utf-8")).hexdigest()
+def inverter_prefix():
+    """
+    The Solis Modbus entity ID prefix, e.g. "solis" for
+    time.solis_grid_time_of_use_charge_start_slot_1. From inverter_prefix, or
+    found from the time entities. Falls back to "solis".
+    """
+    if INVERTER_PREFIX:
+        return INVERTER_PREFIX
+    if _cache["prefix"]:
+        return _cache["prefix"]
+    found = []
+    for entity_id in _entity_ids("time"):
+        name = entity_id.split(".", 1)[-1]
+        if name.endswith("_" + PREFIX_PROBE):
+            found.append(name[:-len(PREFIX_PROBE) - 1])
+    if len(found) == 1:
+        _cache["prefix"] = found[0]
+        log.info("Using Solis Modbus entities with prefix '%s'", found[0])
+        return found[0]
+    if len(found) > 1:
+        log.error("Several Solis Modbus inverters found (%s); set inverter_prefix", ", ".join(sorted(found)))
+    return "solis"
 
 
-def prepare_header(config, body: str, canonicalized_resource: str):
-    content_md5 = digest(body)
-    content_type = "application/json"
-    now = datetime.now(timezone.utc)
-    date = now.strftime("%a, %d %b %Y %H:%M:%S GMT")
-    encrypt_str = (
-        VERB + "\n" + content_md5 + "\n" + content_type + "\n" + date + "\n" + canonicalized_resource
-    )
-    hmac_obj = hmac.new(
-        config["secret"].encode("utf-8"),
-        msg=encrypt_str.encode("utf-8"),
-        digestmod=hashlib.sha1,
-    )
-    sign = base64.b64encode(hmac_obj.digest())
-    authorization = "API " + str(config["key_id"]) + ":" + sign.decode("utf-8")
-    return {
-        "Content-MD5": content_md5,
-        "Content-Type": content_type,
-        "Date": date,
-        "Authorization": authorization,
-    }
+def slot_entity_ids(kind, num):
+    """((start, end) time entities, current number, SOC number, on/off switch) for one slot."""
+    p = inverter_prefix()
+    if kind == "charge":
+        return ((f"time.{p}_grid_time_of_use_charge_start_slot_{num}",
+                 f"time.{p}_grid_time_of_use_charge_end_slot_{num}"),
+                f"number.{p}_grid_time_of_use_charge_battery_current_slot_{num}",
+                f"number.{p}_grid_time_of_use_charge_cut_off_soc_slot_{num}",
+                f"switch.{p}_grid_time_of_use_charging_period_{num}")
+    return ((f"time.{p}_grid_time_of_use_discharge_start_slot_{num}",
+             f"time.{p}_grid_time_of_use_discharge_end_slot_{num}"),
+            f"number.{p}_grid_time_of_use_discharge_battery_current_slot_{num}",
+            f"number.{p}_grid_time_of_use_discharge_cut_off_soc_slot_{num}",
+            f"switch.{p}_grid_time_of_use_discharge_period_{num}")
 
 
-def _clean_json_text(text: str) -> str:
-    # SolisCloud sometimes returns JSON with trailing commas.
-    return re.sub(r'("(?:\\?.)*?")|,\s*([}\]])', r"\1\2", text)
+def _op_entities(op):
+    return list(op[1]) if op[0] == "time" else [op[1]]
 
 
-async def solis_post(session, url_path, body_dict, token=None):
-    body = json.dumps(body_dict, separators=(",", ":"))
-    headers = prepare_header(CFG, body, url_path)
-    if token:
-        headers["token"] = token
-    return await session.post(BASE_URL + url_path, data=body, headers=headers)
+def missing_entities(entity_ids):
+    out = []
+    for entity_id in entity_ids:
+        s = hass.states.get(entity_id)
+        if s is None or str(s.state).lower() == "unavailable":
+            out.append(entity_id)
+    return out
 
 
-async def resp_json(resp):
-    text = await resp.text()
-    return json.loads(_clean_json_text(text))
-
-
-async def solis_login(session):
-    body = {"userInfo": str(CFG["username"]), "password": passwordEncode(str(CFG["password"]))}
-    resp = await solis_post(session, LOGIN_URL, body)
-    if resp.status != HTTPStatus.OK:
-        log.error("Login failed with status %s", resp.status)
-        return None
-    data = await resp_json(resp)
-    token = data.get("csrfToken")
-    if not token:
-        log.error("Login succeeded but csrfToken missing: %s", data)
-    return token
-
-
-async def get_inverter(session):
-    """Return (inverter_id, inverter_sn), cached after the first lookup."""
-    if _cache["inverter_id"] and _cache["inverter_sn"]:
-        return _cache["inverter_id"], _cache["inverter_sn"]
-
-    resp = await solis_post(session, INVERTER_LIST_URL, {"stationId": str(CFG["plantId"])})
-    if resp.status != HTTPStatus.OK:
-        log.error("inverterList failed status %s", resp.status)
-        return None, None
-    data = await resp_json(resp)
-    records = (data.get("data") or {}).get("page", {}).get("records", []) or []
-    if not records:
-        log.error("No inverters returned from inverterList")
-        return None, None
-
-    cfg_sn = str(CFG.get("inverter_sn", "")).strip()
-    cfg_id = str(CFG.get("inverter_id", "")).strip()
-    if cfg_sn.lower() in ("unknown", "unavailable", "none"):
-        cfg_sn = ""
-    if cfg_id.lower() in ("unknown", "unavailable", "none"):
-        cfg_id = ""
-
-    chosen = None
-    if cfg_sn or cfg_id:
-        for r in records:
-            if (cfg_sn and str(r.get("sn")) == cfg_sn) or (cfg_id and str(r.get("id")) == cfg_id):
-                chosen = r
-                break
-    else:
-        storage_records = []
-        for r in records:
-            if str(r.get("productModel")) == "2":
-                storage_records.append(r)
-        if len(storage_records) == 1:
-            chosen = storage_records[0]
-        elif len(storage_records) == 0 and len(records) == 1:
-            chosen = records[0]
-
-    if not chosen:
-        log.error("Could not pick an inverter; set inverter_sn or inverter_id. Available:")
-        for r in records:
-            log.error("  - ID: %s, SN: %s, Name: %s, ProductModel: %s",
-                      r.get("id"), r.get("sn"), r.get("name"), r.get("productModel"))
-        return None, None
-
-    _cache["inverter_id"] = chosen.get("id")
-    _cache["inverter_sn"] = chosen.get("sn")
-    log.info("Using inverter ID=%s SN=%s Name=%s",
-             _cache["inverter_id"], _cache["inverter_sn"], chosen.get("name"))
-    return _cache["inverter_id"], _cache["inverter_sn"]
-
-
-async def get_control_value(session, token, inverter_sn, cid):
-    """Read one CID. Returns its value as a string, or None."""
+async def _call_service(domain, name, data):
+    """Call an HA service, retrying on errors. Returns True on success."""
     for attempt in range(1, CONTROL_RETRIES + 1):
-        r = await solis_post(session, AT_READ_URL,
-                             {"inverterSn": str(inverter_sn), "cid": str(cid)}, token=token)
-        if r.status != HTTPStatus.OK:
-            await asyncio.sleep(0.2)
-            continue
         try:
-            data = await resp_json(r)
-            payload = data.get("data")
-            if isinstance(payload, list) and payload:
-                payload = payload[0]
-            if str(data.get("code")) == "0" and isinstance(payload, dict) and "msg" in payload:
-                return str(payload["msg"])
+            await hass.services.async_call(domain, name, data, blocking=True)
+            return True
         except Exception as e:
-            log.warning("AT_READ cid=%s attempt %s parse error: %s", cid, attempt, e)
-        await asyncio.sleep(0.2)
-    return None
-
-
-async def write_control(session, token, inverter_sn, cid, value, old_value=None):
-    body = {"inverterSn": str(inverter_sn), "cid": str(cid), "value": str(value)}
-    if old_value is not None:
-        body["yuanzhi"] = str(old_value)
-    last_text = None
-    for attempt in range(1, CONTROL_RETRIES + 1):
-        r = await solis_post(session, CONTROL_URL, body, token=token)
-        try:
-            last_text = await r.text()
-        except Exception:
-            last_text = None
-
-        if r.status != HTTPStatus.OK:
-            log.warning("CONTROL cid=%s attempt %s/%s http=%s", cid, attempt, CONTROL_RETRIES, r.status)
-            await asyncio.sleep(0.3)
-            continue
-        try:
-            data = json.loads(_clean_json_text(last_text or ""))
-            payload = data.get("data") or []
-            if str(data.get("code")) == "0" and payload and str(payload[0].get("code")) == "0":
-                if VERIFY_READBACK:
-                    await asyncio.sleep(CONTROL_DELAY)
-                    rb = await get_control_value(session, token, inverter_sn, cid)
-                    if rb is not None and rb != str(value):
-                        log.warning("Readback cid=%s: wrote '%s' but read '%s'", cid, value, rb)
-                    else:
-                        log.debug("Readback cid=%s: %s", cid, rb)
-                return True
-        except Exception as e:
-            log.warning("CONTROL cid=%s attempt %s/%s parse error: %s", cid, attempt, CONTROL_RETRIES, e)
-        await asyncio.sleep(0.3)
-
-    log.error("CONTROL cid=%s failed after %s attempts. Last response: %s", cid, CONTROL_RETRIES, last_text)
+            log.warning("%s.%s %s attempt %s/%s failed: %s", domain, name, data.get("entity_id"),
+                        attempt, CONTROL_RETRIES, e)
+            await asyncio.sleep(CONTROL_DELAY)
+    log.error("%s.%s %s failed after %s attempts", domain, name, data.get("entity_id"), CONTROL_RETRIES)
     return False
 
 
-async def read_slot_switches(session, token, inverter_sn):
-    """Return {cid: "0"/"1"} for the 12 slot switches; unreadable ones are left out."""
-    states = {}
+async def _readback(entity_id, matches):
+    if not VERIFY_READBACK:
+        return
+    await asyncio.sleep(CONTROL_DELAY)
+    s = hass.states.get(entity_id)
+    value = None if s is None else str(s.state)
+    if value is None or not matches(value):
+        log.warning("Readback %s: got '%s' after writing", entity_id, value)
+    else:
+        log.debug("Readback %s: %s", entity_id, value)
+
+
+async def write_time(entity_id, hhmm):
+    log.info("Setting %s to %s", entity_id, hhmm)
+    if not await _call_service("time", "set_value", {"entity_id": entity_id, "time": f"{hhmm}:00"}):
+        return False
+    await _readback(entity_id, lambda v: v[:5] == hhmm)
+    return True
+
+
+async def write_window(entity_ids, window):
+    """Write "HH:MM-HH:MM" to a slot's start and end time entities."""
+    start, _, end = str(window).replace(" ", "").partition("-")
+    if not await write_time(entity_ids[0], start):
+        return False
+    await asyncio.sleep(INTER_WRITE_DELAY)
+    return await write_time(entity_ids[1], end)
+
+
+def _same_number(a, b):
     try:
-        r = await solis_post(session, AT_READ_BATCH_URL,
-                             {"inverterSn": str(inverter_sn), "cids": ",".join(SLOT_SWITCH_CIDS)},
-                             token=token)
-        if r.status == HTTPStatus.OK:
-            data = await resp_json(r)
-            if str(data.get("code")) == "0":
-                for outer in data.get("data") or []:
-                    items = outer if isinstance(outer, list) else [outer]
-                    for item in items:
-                        if isinstance(item, dict) and "cid" in item and "msg" in item:
-                            states[str(item["cid"])] = str(item["msg"])
-        else:
-            log.warning("atReadBatch for slot switches failed http=%s", r.status)
-    except Exception as e:
-        log.warning("atReadBatch for slot switches failed: %s", e)
-
-    for cid in SLOT_SWITCH_CIDS:
-        if cid not in states:
-            value = await get_control_value(session, token, inverter_sn, cid)
-            if value is not None:
-                states[cid] = value
-    log.debug("Slot switch states: %s", states)
-    return states
+        return abs(float(a) - float(b)) < 0.05
+    except (TypeError, ValueError):
+        return False
 
 
-def slot_switch_mask(states):
-    """The "yuanzhi" bitmask for the current switch states, or None if any is unknown."""
-    mask = 0
-    for bit, cid in enumerate(SLOT_SWITCH_CIDS):
-        if cid not in states:
-            return None
-        if states[cid] == "1":
-            mask |= 1 << bit
-    return str(mask)
+async def write_number(entity_id, value):
+    log.info("Setting %s to %s", entity_id, value)
+    number = float(value)
+    if not await _call_service("number", "set_value", {"entity_id": entity_id, "value": number}):
+        return False
+    await _readback(entity_id, lambda v: _same_number(v, number))
+    return True
 
 
-async def sync_inverter_time(session, token, inverter_id):
-    value = datetime.now(INV_TZ).strftime("%Y-%m-%d %H:%M:%S")
-    body = f'{{"inverterId":"{inverter_id}","cid":"56","value":"{value}"}}'
-    headers = prepare_header(CFG, body, CONTROL_URL)
-    headers["token"] = token
-    try:
-        resp = await session.post(BASE_URL + CONTROL_URL, data=body, headers=headers)
-        if resp.status == HTTPStatus.OK:
-            data = await resp_json(resp)
-            if str(data.get("code")) == "0":
-                log.info("Synced inverter time to %s (%s)", value, INVERTER_TIMEZONE)
-                _cache["last_time_sync"] = datetime.now(timezone.utc)
-                return
-            log.warning("Time sync returned code=%s msg=%s", data.get("code"), data.get("msg"))
-        else:
-            log.warning("Time sync HTTP status: %s", resp.status)
-    except Exception as e:
-        log.error("Time sync failed: %s", e)
-
-
-def switch_name(cid):
-    """'charge slot 2' / 'discharge slot 1' for a switch CID."""
-    if cid in CHARGE_SWITCH_CIDS:
-        return f"charge slot {CHARGE_SWITCH_CIDS.index(cid) + 1}"
-    if cid in DISCHARGE_SWITCH_CIDS:
-        return f"discharge slot {DISCHARGE_SWITCH_CIDS.index(cid) + 1}"
-    return f"CID {cid}"
-
-
-async def set_slot_switch(session, token, inverter_sn, states, cid, enabled):
-    """Switch a slot on/off if it isn't already. Updates `states` on success."""
-    want = "1" if enabled else "0"
-    if states.get(cid) == want:
+def switch_is(entity_id):
+    """True/False for a switch that's on/off, None if unknown."""
+    s = hass.states.get(entity_id)
+    if s is None:
+        return None
+    value = str(s.state).lower()
+    if value == "on":
         return True
-    old_value = slot_switch_mask(states)
-    if old_value is None:
-        log.warning("Slot switch states unknown; writing CID %s without yuanzhi", cid)
-    log.info("%s %s (CID %s)", "Enabling" if enabled else "Disabling", switch_name(cid), cid)
-    ok = await write_control(session, token, inverter_sn, cid, want, old_value=old_value)
-    if ok:
-        states[cid] = want
-    return ok
+    if value == "off":
+        return False
+    return None
 
 
-async def solis_connect():
-    """Log in and pick the inverter. Returns (session, token, inverter_id, inverter_sn) or None."""
-    session = async_get_clientsession(hass)
-    _flags["logins"] += 1
-    token = await solis_login(session)
-    if not token:
-        return None
-    inverter_id, inverter_sn = await get_inverter(session)
-    if not inverter_sn:
-        return None
-    return session, token, inverter_id, inverter_sn
+async def set_slot_switch(entity_id, enabled):
+    """Switch a slot on/off if it isn't already."""
+    if switch_is(entity_id) is enabled:
+        return True
+    log.info("%s %s", "Enabling" if enabled else "Disabling", entity_id)
+    if not await _call_service("switch", "turn_on" if enabled else "turn_off", {"entity_id": entity_id}):
+        return False
+    await _readback(entity_id, lambda v: v.lower() == ("on" if enabled else "off"))
+    return True
 
 
 async def solis_apply(ops):
     """
-    Apply slot changes in order, in one SolisCloud session and under the write
-    lock, so the switch bitmask is read and written as a pair. `ops` is a list
-    of ("value", cid, value) and ("switch", switch_cid, enabled). Stops at the
-    first failure (a slot is never switched on after a failed write). Returns
-    True if everything succeeded.
+    Apply slot changes in order, under the write lock, through the Solis Modbus
+    entities. `ops` is a list of ("time", (start, end), "HH:MM-HH:MM"),
+    ("value", number_entity, value) and ("switch", switch_entity, enabled).
+    Stops at the first failure (a slot is never switched on after a failed
+    write). Returns True if everything succeeded.
     """
     if not ops:
         return True
@@ -653,53 +502,49 @@ async def solis_apply(ops):
         await asyncio.sleep(0.5)
     _flags["write_lock"] = True
     try:
-        conn = await solis_connect()
-        if conn is None:
-            return False
-        session, token, inverter_id, inverter_sn = conn
-
-        if SYNC_INVERTER_TIME:
-            last = _cache["last_time_sync"]
-            if last is None or datetime.now(timezone.utc) - last > timedelta(hours=24):
-                await sync_inverter_time(session, token, inverter_id)
-
-        switches = None
+        _flags["write_batches"] += 1
+        needed = []
         for op in ops:
-            if op[0] == "switch" and switches is None:
-                switches = await read_slot_switches(session, token, inverter_sn)
+            needed.extend(_op_entities(op))
+        missing = missing_entities(needed)
+        if missing:
+            log.error("Solis Modbus entities missing or unavailable: %s. Check the Solis Modbus "
+                      "integration and inverter_prefix.", ", ".join(missing))
+            return False
 
         for op in ops:
             if op[0] == "switch":
-                if not await set_slot_switch(session, token, inverter_sn, switches, op[1], op[2]):
-                    return False
+                ok = await set_slot_switch(op[1], op[2])
+            elif op[0] == "time":
+                ok = await write_window(op[1], op[2])
             else:
-                log.info("Writing CID %s = %s", op[1], op[2])
-                if not await write_control(session, token, inverter_sn, op[1], op[2]):
-                    return False
+                ok = await write_number(op[1], op[2])
+            if not ok:
+                return False
             await asyncio.sleep(INTER_WRITE_DELAY)
         return True
     finally:
         _flags["write_lock"] = False
 
 
-async def log_storage_mode():
-    """Read the storage mode once so the log shows whether TOU is likely enabled."""
-    if DIAGNOSTICS_ONLY:
+def check_inverter_entities():
+    """Log once at startup whether the Solis Modbus slot entities this app needs exist."""
+    needed = []
+    for key in active_slot_keys():
+        times, current, soc, switch = slot_entities(key)
+        needed.extend(list(times) + [current, soc, switch])
+    if not needed:
         return
-    try:
-        conn = await solis_connect()
-        if conn is None:
-            return
-        session, token, _, inverter_sn = conn
-        value = await get_control_value(session, token, inverter_sn, STORAGE_MODE_CID)
-        log.info("Inverter storage mode (CID %s) = %s. Time-of-use / timed charge-discharge "
-                 "must be enabled for the slots to work.", STORAGE_MODE_CID, value)
-    except Exception as e:
-        log.warning("Could not read storage mode: %s", e)
+    missing = missing_entities(needed)
+    if missing:
+        log.error("Solis Modbus entities not found (prefix '%s'): %s. Install the Solis Modbus "
+                  "integration, check the inverter supports Grid Time of Use slots, or set "
+                  "inverter_prefix.", inverter_prefix(), ", ".join(missing))
+    else:
+        log.info("Solis Modbus slot entities found (prefix '%s'). Time-of-use must be enabled on "
+                 "the inverter for the slots to work.", inverter_prefix())
 
 
-# -----------------------------
-# Time and HA state helpers
 # -----------------------------
 def _parse_window(text):
     start_s, end_s = text.split("-")
@@ -1852,13 +1697,10 @@ def empty_want():
     return {"window": EMPTY_SLOT, "current": None, "soc": None, "enabled": False}
 
 
-def slot_cids(key):
-    """(time, current, soc, switch) CIDs for one of our slots."""
+def slot_entities(key):
+    """((start, end) times, current, soc, switch) Solis Modbus entities for one of our slots."""
     kind, num = SLOT_DEFS[key]
-    i = num - 1
-    if kind == "charge":
-        return CHARGE_TIME_CIDS[i], CHARGE_CURRENT_CIDS[i], CHARGE_SOC_CIDS[i], CHARGE_SWITCH_CIDS[i]
-    return DISCHARGE_TIME_CIDS[i], DISCHARGE_CURRENT_CIDS[i], DISCHARGE_SOC_CIDS[i], DISCHARGE_SWITCH_CIDS[i]
+    return slot_entity_ids(kind, num)
 
 
 def slot_ops(key, want, current_step=1):
@@ -1869,43 +1711,43 @@ def slot_ops(key, want, current_step=1):
     """
     have = _slots[key]
     unknown = have["unknown"]
-    time_cid, current_cid, soc_cid, switch_cid = slot_cids(key)
+    time_ids, current_id, soc_id, switch_id = slot_entities(key)
     ops = []
 
     if not want["enabled"]:
         if unknown or have["enabled"]:
-            ops.append(("switch", switch_cid, False))
+            ops.append(("switch", switch_id, False))
         if unknown or have["window"] != EMPTY_SLOT:
-            ops.append(("value", time_cid, EMPTY_SLOT))
+            ops.append(("time", time_ids, EMPTY_SLOT))
         return ops
 
     fresh = unknown or not have["enabled"]
     moved = fresh or have["window"] != want["window"]
     if moved:
-        ops.append(("value", time_cid, want["window"]))
+        ops.append(("time", time_ids, want["window"]))
     if want["current"] is not None and (
             moved or have["current"] is None
             or abs(want["current"] - have["current"]) >= max(1, current_step)):
-        ops.append(("value", current_cid, str(want["current"])))
+        ops.append(("value", current_id, str(want["current"])))
     if want["soc"] is not None and (moved or want["soc"] != have["soc"]):
-        ops.append(("value", soc_cid, str(want["soc"])))
+        ops.append(("value", soc_id, str(want["soc"])))
     if fresh:
-        ops.append(("switch", switch_cid, True))
+        ops.append(("switch", switch_id, True))
     return ops
 
 
 def apply_slot_ops(key, ops, ends=None):
     """Record successful writes for slot `key`."""
     program = _slots[key]
-    time_cid, current_cid, soc_cid, switch_cid = slot_cids(key)
+    time_ids, current_id, soc_id, switch_id = slot_entities(key)
     for op in ops:
         if op[0] == "switch":
             program["enabled"] = op[2]
-        elif op[1] == time_cid:
+        elif op[1] == time_ids:
             program["window"] = op[2]
-        elif op[1] == current_cid:
+        elif op[1] == current_id:
             program["current"] = int(op[2])
-        elif op[1] == soc_cid:
+        elif op[1] == soc_id:
             program["soc"] = int(op[2])
     if not program["enabled"] and program["window"] == EMPTY_SLOT:
         program["current"] = None
@@ -2031,8 +1873,9 @@ def order_ops(per_slot):
 def clear_other_ops():
     ops = []
     for num in other_charge_slots():
-        ops.append(("switch", CHARGE_SWITCH_CIDS[num - 1], False))
-        ops.append(("value", CHARGE_TIME_CIDS[num - 1], EMPTY_SLOT))
+        time_ids, _, _, switch_id = slot_entity_ids("charge", num)
+        ops.append(("switch", switch_id, False))
+        ops.append(("time", time_ids, EMPTY_SLOT))
     return ops
 
 
@@ -2211,6 +2054,7 @@ def publish_overview(now, export_window, hh_window):
                      "peak_export": PEAK_EXPORT, "axle": AXLE_EVENTS,
                      "renault": RENAULT_ENABLED},
         "slot_problems": SLOT_PROBLEMS or None,
+        "inverter_prefix": inverter_prefix() if INVERTER_CONTROL else None,
         "last_reason": _flags["last_reason"],
         "last_write_ok": _flags["last_write_ok"],
         "diagnostics_only": DIAGNOSTICS_ONLY,
@@ -2405,7 +2249,7 @@ async def solis_octopus_startup():
     await asyncio.sleep(STARTUP_DELAY_SECONDS)
     if HH_ENABLED:
         hh_seed(now_local())
-    await log_storage_mode()
+    check_inverter_entities()
     await pd_auto_join()
     await hh_auto_join()
     _flags["started"] = True

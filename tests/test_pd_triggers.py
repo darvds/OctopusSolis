@@ -1,6 +1,6 @@
 import unittest
 
-from tests.harness import App, EVENTS, event
+from tests.harness import App, EVENTS, discharge_slot, event
 
 
 class TriggerTests(unittest.TestCase):
@@ -35,10 +35,11 @@ class TriggerTests(unittest.TestCase):
         self.assertEqual(len(app.ops), 1)
 
     def test_clear_service(self):
-        app = App({"sync_inverter_time": False})
-        app.cloud.values["5922"] = "1"
+        app = App()
+        times, _, _, switch = discharge_slot(1)
+        app.modbus.set(switch, "on")
         app.run(app.solis_octopus_clear())
-        self.assertEqual([w[0] for w in app.cloud.control_writes()], ["5922", "5964"])
+        self.assertEqual(app.modbus.written(), [switch, times[0], times[1]])
         self.assertFalse(app.g["_slots"]["export"]["unknown"])
 
     def test_preview_uses_available_session(self):

@@ -1,6 +1,6 @@
 import unittest
 
-from tests.harness import SWITCH_CID, App, AXLE_SENSORS, TIME_CID, event, local
+from tests.harness import EXPORT_SWITCH, App, AXLE_SENSORS, EXPORT_TIME, event, local
 
 
 def axle_app(config=None, joined=()):
@@ -111,7 +111,7 @@ class AxleStandAsideTests(unittest.TestCase):
         app.set_soc(100)
         app.at("15:45")
         app.reconcile()
-        self.assertEqual(app.ops[-1][0], ("value", TIME_CID, "16:00-17:30"))
+        self.assertEqual(app.ops[-1][0], ("time", EXPORT_TIME, "16:00-17:30"))
         for hhmm in ("17:30", "17:45", "18:30", "18:35"):
             with self.subTest(time=hhmm):
                 app.ops.clear()
@@ -135,12 +135,12 @@ class AxleStandAsideTests(unittest.TestCase):
         app.set_soc(100)
         app.at("15:45")
         app.reconcile()
-        self.assertEqual(app.ops[-1][0], ("value", TIME_CID, "16:00-19:00"))
+        self.assertEqual(app.ops[-1][0], ("time", EXPORT_TIME, "16:00-19:00"))
         app.ops.clear()
         app.set_axle("export", "17:30", "18:30")
         app.at("17:35")
         app.reconcile()
-        self.assertEqual(app.ops, [[("switch", SWITCH_CID, False), ("value", TIME_CID, "00:00-00:00")]])
+        self.assertEqual(app.ops, [[("switch", EXPORT_SWITCH, False), ("time", EXPORT_TIME, "00:00-00:00")]])
         app.ops.clear()
         app.at("17:40")
         app.reconcile()
@@ -161,7 +161,7 @@ class AxleStandAsideTests(unittest.TestCase):
         app.set_axle("export", "20:00", "21:00")
         app.at("19:05")
         app.reconcile("startup")
-        self.assertEqual(app.ops, [[("switch", SWITCH_CID, False), ("value", TIME_CID, "00:00-00:00")]])
+        self.assertEqual(app.ops, [[("switch", EXPORT_SWITCH, False), ("time", EXPORT_TIME, "00:00-00:00")]])
         self.assertEqual(app.status()[1], "axle_upcoming")
 
     def test_import_event_stops_peak_export(self):
@@ -170,7 +170,7 @@ class AxleStandAsideTests(unittest.TestCase):
         app.set_soc(100)
         app.at("16:30")
         app.reconcile()
-        self.assertEqual(app.ops[-1][0], ("value", TIME_CID, "16:00-17:00"))
+        self.assertEqual(app.ops[-1][0], ("time", EXPORT_TIME, "16:00-17:00"))
         app.ops.clear()
         app.at("17:15")
         app.reconcile()

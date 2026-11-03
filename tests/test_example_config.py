@@ -39,7 +39,7 @@ class ExampleConfigTests(unittest.TestCase):
     def test_reconciles_in_diagnostics_mode(self):
         app = App(raw=load_example())
         app.reconcile("startup")
-        self.assertEqual(app.cloud.calls, [])  # diagnostics: nothing sent
+        self.assertEqual(app.modbus.calls, [])  # diagnostics: nothing written
         self.assertIsNotNone(app.overview())
 
 

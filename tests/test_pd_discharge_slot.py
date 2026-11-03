@@ -1,10 +1,10 @@
 import unittest
 
-from tests.harness import (App, CURRENT_CID, SOC_CID, SWITCH_CID, TIME_CID, event)
+from tests.harness import (App, EXPORT_CURRENT, EXPORT_SOC, EXPORT_SWITCH, EXPORT_TIME, discharge_slot, event)
 
-ARM = [("value", TIME_CID, "17:00-18:00"), ("value", CURRENT_CID, "35"),
-       ("value", SOC_CID, "38"), ("switch", SWITCH_CID, True)]
-CLEAR = [("switch", SWITCH_CID, False), ("value", TIME_CID, "00:00-00:00")]
+ARM = [("time", EXPORT_TIME, "17:00-18:00"), ("value", EXPORT_CURRENT, "35"),
+       ("value", EXPORT_SOC, "38"), ("switch", EXPORT_SWITCH, True)]
+CLEAR = [("switch", EXPORT_SWITCH, False), ("time", EXPORT_TIME, "00:00-00:00")]
 
 
 def armed_app(config=None):
@@ -28,7 +28,7 @@ class SessionScenarioTests(unittest.TestCase):
             # Discharging on plan: 5.5 - 0.5 h x 1.75 = 4.625 kWh, still ~35 A.
             ("17:30", 46.25, [], "exporting"),
             # Running hot (SOC lower than planned): current drops by >= 5 A.
-            ("17:30", 42, [[("value", CURRENT_CID, "18")]], "exporting"),
+            ("17:30", 42, [[("value", EXPORT_CURRENT, "18")]], "exporting"),
             ("18:00", 38, [CLEAR], "idle"),
             ("18:05", 38, [], "idle"),
         ]
@@ -75,8 +75,8 @@ class SessionScenarioTests(unittest.TestCase):
         app.at("17:30")
         app.set_soc(46.25)
         app.reconcile("startup")
-        self.assertEqual(app.ops, [[("value", TIME_CID, "17:00-18:00"), ("value", CURRENT_CID, "35"),
-                                    ("value", SOC_CID, "38"), ("switch", SWITCH_CID, True)]])
+        self.assertEqual(app.ops, [[("time", EXPORT_TIME, "17:00-18:00"), ("value", EXPORT_CURRENT, "35"),
+                                    ("value", EXPORT_SOC, "38"), ("switch", EXPORT_SWITCH, True)]])
 
     def test_no_spare_energy_leaves_slot_off(self):
         app = armed_app()
@@ -127,52 +127,63 @@ class SessionScenarioTests(unittest.TestCase):
         app.at("16:45")
         app.set_soc(56.25)
         app.reconcile()
-        self.assertEqual([op[1] for op in app.ops[0][:3]], ["5968", "5971", "5969"])
+        times, current, soc, _ = discharge_slot(2)
+        self.assertEqual([op[1] for op in app.ops[0][:3]], [times, current, soc])
 
 
-class SolisCloudTests(unittest.TestCase):
-    """The real solis_apply against the fake SolisCloud."""
+class SolisModbusTests(unittest.TestCase):
+    """The real solis_apply against the fake Solis Modbus entities."""
 
-    def test_arm_writes_in_order_with_yuanzhi(self):
-        app = App({"sync_inverter_time": False})
-        app.cloud.values["5916"] = "1"  # charge slot 1 (core window) is on
+    def test_arm_writes_in_order(self):
+        app = App()
         ok = app.run(app.solis_apply(ARM))
         self.assertTrue(ok)
-        self.assertEqual(app.cloud.control_writes(), [
-            (TIME_CID, "17:00-18:00", None),
-            (CURRENT_CID, "35", None),
-            (SOC_CID, "38", None),
-            (SWITCH_CID, "1", "1"),
+        self.assertEqual(app.modbus.writes(), [
+            (EXPORT_TIME[0], "17:00"),
+            (EXPORT_TIME[1], "18:00"),
+            (EXPORT_CURRENT, "35"),
+            (EXPORT_SOC, "38"),
+            (EXPORT_SWITCH, "on"),
         ])
 
     def test_clear_switches_off_first(self):
-        app = App({"sync_inverter_time": False})
-        app.cloud.values[SWITCH_CID] = "1"
+        app = App()
+        app.modbus.set(EXPORT_SWITCH, "on")
         app.run(app.solis_apply(CLEAR))
-        self.assertEqual(app.cloud.control_writes(), [
-            (SWITCH_CID, "0", str(1 << 6)),
-            (TIME_CID, "00:00-00:00", None),
+        self.assertEqual(app.modbus.writes(), [
+            (EXPORT_SWITCH, "off"),
+            (EXPORT_TIME[0], "00:00"),
+            (EXPORT_TIME[1], "00:00"),
         ])
 
     def test_failure_stops_before_switching_on(self):
-        app = App({"sync_inverter_time": False, "control_retries": 1})
-        app.cloud.fail_cids.add(CURRENT_CID)
-        ok = app.run(app.solis_apply(ARM))
+        app = App({"control_retries": 1})
+        app.modbus.fail.add(EXPORT_CURRENT)
+        with self.assertLogs("pyscript.solis_octopus", level="ERROR"):
+            ok = app.run(app.solis_apply(ARM))
         self.assertFalse(ok)
-        cids = [w[0] for w in app.cloud.control_writes()]
-        self.assertNotIn(SWITCH_CID, cids)
+        self.assertNotIn(EXPORT_SWITCH, app.modbus.written())
 
     def test_diagnostics_only_writes_nothing(self):
         app = App({"diagnostics_only": True})
         self.assertTrue(app.run(app.solis_apply(ARM)))
-        self.assertEqual(app.cloud.calls, [])
+        self.assertEqual(app.modbus.calls, [])
 
-    def test_time_sync_daily(self):
+    def test_missing_entities_write_nothing(self):
         app = App()
-        app.run(app.solis_apply(CLEAR))
-        app.run(app.solis_apply(CLEAR))
-        syncs = [c for c in app.cloud.calls if c["body"].get("cid") == "56"]
-        self.assertEqual(len(syncs), 1)
+        del app.states[EXPORT_SOC]
+        with self.assertLogs("pyscript.solis_octopus", level="ERROR") as logs:
+            ok = app.run(app.solis_apply(ARM))
+        self.assertFalse(ok)
+        self.assertEqual(app.modbus.calls, [])
+        self.assertTrue(any(EXPORT_SOC in line for line in logs.output))
+
+    def test_unavailable_entities_write_nothing(self):
+        app = App()
+        app.modbus.set(EXPORT_SWITCH, "unavailable")
+        with self.assertLogs("pyscript.solis_octopus", level="ERROR"):
+            self.assertFalse(app.run(app.solis_apply(ARM)))
+        self.assertEqual(app.modbus.calls, [])
 
 
 if __name__ == "__main__":

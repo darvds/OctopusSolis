@@ -5,13 +5,12 @@ pyscript injects globals (pyscript, hass, state, task, service, time_trigger,
 state_trigger, event_trigger) into each script, so the app can't be imported
 normally. The harness compiles the file into a fresh namespace with fakes for
 all of those, plus a fake asyncio (instant sleeps), a fake clock, fake HA
-services and a fake SolisCloud.
+services and a fake Solis Modbus integration (its time, number and switch
+entities).
 """
 import asyncio
 import copy
-import json
 import logging
-import sys
 import types
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,11 +32,6 @@ DISPATCH = "binary_sensor.octopus_energy_test_intelligent_dispatching"
 WATER_HEATER = "water_heater.octopus_energy_heat_pump_abc"
 
 BASE_CONFIG = {
-    "key_id": "test-key",
-    "secret": "test-secret",
-    "username": "user@example.com",
-    "password": "hunter2",
-    "plantId": "1234",
     "inverter_timezone": "Europe/London",
     "inter_write_delay": 0,
     "battery": {
@@ -94,32 +88,40 @@ LEGACY_KEYS = {
 }
 SECTIONS = ("battery", "ev_follow", "happy_hour", "power_down", "peak_export", "axle", "slots")
 
-# Duplicated from the app on purpose, so a wrong CID in the app fails the tests.
-TIME_CID, CURRENT_CID, SOC_CID, SWITCH_CID = "5964", "5967", "5965", "5922"
-CHARGE_TIME_CIDS = ["5946", "5949", "5952", "5955", "5958", "5961"]
-CHARGE_CURRENT_CIDS = ["5948", "5951", "5954", "5957", "5960", "5963"]
-CHARGE_SOC_CIDS = ["5928", "5929", "5930", "5931", "5932", "5933"]
-CHARGE_SWITCH_CIDS = ["5916", "5917", "5918", "5919", "5920", "5921"]
-DISCHARGE_SWITCH_CIDS = ["5922", "5923", "5924", "5925", "5926", "5927"]
-SLOT_SWITCH_CIDS = CHARGE_SWITCH_CIDS + DISCHARGE_SWITCH_CIDS
+# Duplicated from the app on purpose, so a wrong entity ID in the app fails the tests.
+PREFIX = "solis"
+
+
+def charge_slot(n, prefix=PREFIX):
+    """((start, end), current, soc, switch) Solis Modbus entities for charge slot n."""
+    return ((f"time.{prefix}_grid_time_of_use_charge_start_slot_{n}",
+             f"time.{prefix}_grid_time_of_use_charge_end_slot_{n}"),
+            f"number.{prefix}_grid_time_of_use_charge_battery_current_slot_{n}",
+            f"number.{prefix}_grid_time_of_use_charge_cut_off_soc_slot_{n}",
+            f"switch.{prefix}_grid_time_of_use_charging_period_{n}")
+
+
+def discharge_slot(n, prefix=PREFIX):
+    return ((f"time.{prefix}_grid_time_of_use_discharge_start_slot_{n}",
+             f"time.{prefix}_grid_time_of_use_discharge_end_slot_{n}"),
+            f"number.{prefix}_grid_time_of_use_discharge_battery_current_slot_{n}",
+            f"number.{prefix}_grid_time_of_use_discharge_cut_off_soc_slot_{n}",
+            f"switch.{prefix}_grid_time_of_use_discharge_period_{n}")
+
+
+# Discharge slot 1 (the export slot).
+EXPORT_TIME, EXPORT_CURRENT, EXPORT_SOC, EXPORT_SWITCH = discharge_slot(1)
+CHARGE_TIMES = [charge_slot(n)[0] for n in range(1, 7)]
+CHARGE_CURRENTS = [charge_slot(n)[1] for n in range(1, 7)]
+CHARGE_SOCS = [charge_slot(n)[2] for n in range(1, 7)]
+CHARGE_SWITCHES = [charge_slot(n)[3] for n in range(1, 7)]
+DISCHARGE_SWITCHES = [discharge_slot(n)[3] for n in range(1, 7)]
 
 
 # Keep the app's log output out of the test run (assertLogs still works).
 _app_log = logging.getLogger("pyscript.solis_octopus")
 _app_log.addHandler(logging.NullHandler())
 _app_log.propagate = False
-
-
-def _install_homeassistant_stub():
-    if "homeassistant.helpers.aiohttp_client" in sys.modules:
-        return
-    ha = types.ModuleType("homeassistant")
-    helpers = types.ModuleType("homeassistant.helpers")
-    client = types.ModuleType("homeassistant.helpers.aiohttp_client")
-    client.async_get_clientsession = lambda hass: None
-    sys.modules["homeassistant"] = ha
-    sys.modules["homeassistant.helpers"] = helpers
-    sys.modules["homeassistant.helpers.aiohttp_client"] = client
 
 
 def build_config(*overrides):
@@ -173,8 +175,11 @@ class FakeServices:
     def __init__(self):
         self.calls = []
         self.fail = set()
+        self.modbus = None
 
     async def async_call(self, domain, service, data=None, blocking=False, target=None):
+        if self.modbus is not None and self.modbus.handles(domain, data):
+            return self.modbus.call(domain, service, data)
         self.calls.append({"domain": domain, "service": service, "data": data or {}, "target": target})
         if (domain, service) in self.fail:
             raise RuntimeError("service failed")
@@ -202,73 +207,60 @@ class FakeServices:
 
 
 # -----------------------------
-# Fake SolisCloud
+# Fake Solis Modbus
 # -----------------------------
-OK_CONTROL = {"code": "0", "data": [{"code": "0"}]}
+class FakeModbus:
+    """
+    The Solis Modbus integration's slot entities, kept in the app's HA states,
+    and the time.set_value / number.set_value / switch.turn_on|off calls on them.
+    """
 
-
-def storage_inverter(inv_id="111", sn="SN111", name="Solis"):
-    return {"id": inv_id, "sn": sn, "name": name, "productModel": "2"}
-
-
-class FakeResponse:
-    def __init__(self, status=200, body=None):
-        self.status = status
-        self._text = body if isinstance(body, str) else json.dumps(body if body is not None else {})
-
-    async def text(self):
-        return self._text
-
-
-class FakeSolisCloud:
-    """Records every POST and answers like SolisCloud."""
-
-    def __init__(self):
+    def __init__(self, states, prefix=PREFIX):
+        self.states = states
         self.calls = []
-        self.records = [storage_inverter()]
-        self.fail_cids = set()
-        self.queued = {}
-        self.values = {cid: "0" for cid in SLOT_SWITCH_CIDS}
-        self.values["636"] = "35"
+        self.fail = set()
+        self.entities = set()
+        for n in range(1, 7):
+            for times, current, soc, switch in (charge_slot(n, prefix), discharge_slot(n, prefix)):
+                for t in times:
+                    states[t] = ("00:00:00", {})
+                states[current] = ("0.0", {})
+                states[soc] = ("100.0", {})
+                states[switch] = ("off", {})
+                self.entities.update(list(times) + [current, soc, switch])
 
-    async def post(self, url, data=None, headers=None):
-        path = url.split(":13333", 1)[1]
-        body = json.loads(data)
-        self.calls.append({"path": path, "body": body, "headers": headers or {}})
-        if self.queued.get(path):
-            return self.queued[path].pop(0)
-        if path == "/v2/api/login":
-            return FakeResponse(200, {"csrfToken": "tok-123"})
-        if path == "/v1/api/inverterList":
-            return FakeResponse(200, {"data": {"page": {"records": self.records}}})
-        if path == "/v2/api/control":
-            if str(body["cid"]) in self.fail_cids:
-                return FakeResponse(500, {})
-            self.values[str(body["cid"])] = str(body["value"])
-            return FakeResponse(200, OK_CONTROL)
-        if path == "/v2/api/atRead":
-            return FakeResponse(200, {"code": "0", "data": {"msg": self.values.get(str(body["cid"]), "")}})
-        if path == "/v2/api/atReadBatch":
-            items = [{"cid": int(cid), "msg": self.values.get(cid, "")} for cid in body["cids"].split(",")]
-            return FakeResponse(200, {"code": "0", "data": [items]})
-        return FakeResponse(404, {})
+    def handles(self, domain, data):
+        return domain in ("time", "number", "switch") and (data or {}).get("entity_id") in self.entities
 
-    def paths(self):
-        return [c["path"] for c in self.calls]
+    def call(self, domain, service, data):
+        entity_id = data["entity_id"]
+        if entity_id in self.fail:
+            raise RuntimeError(f"modbus write to {entity_id} failed")
+        if domain == "time":
+            value = data["time"]
+        elif domain == "number":
+            value = str(float(data["value"]))
+        else:
+            value = "on" if service == "turn_on" else "off"
+        self.calls.append((domain, service, entity_id, value))
+        self.states[entity_id] = (value, {})
 
-    def control_writes(self):
-        """(cid, value, yuanzhi) for every control write in order, excluding the time sync."""
+    def set(self, entity_id, value):
+        self.states[entity_id] = (value, {})
+
+    def writes(self):
+        """(entity_id, value) for every write, in order: times as HH:MM, numbers as ints, switches as on/off."""
         out = []
-        for c in self.calls:
-            if c["path"] == "/v2/api/control" and c["body"].get("cid") != "56":
-                out.append((c["body"]["cid"], c["body"]["value"], c["body"].get("yuanzhi")))
+        for domain, _, entity_id, value in self.calls:
+            if domain == "time":
+                value = value[:5]
+            elif domain == "number":
+                value = str(int(float(value))) if float(value).is_integer() else value
+            out.append((entity_id, value))
         return out
 
-    def logins(self):
-        return [c for c in self.calls if c["path"] == "/v2/api/login"]
-
-    def time_syncs(self):
-        return [c for c in self.calls if c["path"] == "/v2/api/control" and c["body"].get("cid") == "56"]
+    def written(self):
+        return [w[0] for w in self.writes()]
 
 
 # -----------------------------
@@ -276,7 +268,6 @@ class FakeSolisCloud:
 # -----------------------------
 class App:
     def __init__(self, config=None, *more, started=True, raw=None):
-        _install_homeassistant_stub()
         cfg = raw if raw is not None else build_config(config, *more)
 
         self.states = {}
@@ -285,13 +276,14 @@ class App:
         self.service_funcs = []
         self.unique_calls = []
         self.asyncio = FakeAsyncio()
-        self.cloud = FakeSolisCloud()
         self.services = FakeServices()
+        self.modbus = FakeModbus(self.states)
+        self.services.modbus = self.modbus
         self.ops = None  # set by capture_ops()
 
         hass = types.SimpleNamespace(
             config=types.SimpleNamespace(time_zone="Europe/London"),
-            states=types.SimpleNamespace(get=self._get_state),
+            states=types.SimpleNamespace(get=self._get_state, async_entity_ids=self._entity_ids),
             services=self.services,
         )
         g = {
@@ -309,7 +301,6 @@ class App:
         exec(compile(source, str(APP_PATH), "exec"), g)
 
         g["asyncio"] = self.asyncio
-        g["async_get_clientsession"] = lambda _hass: self.cloud
         self.load_profile = {}
 
         async def fake_fetch():
@@ -327,6 +318,9 @@ class App:
             value, attrs = self.states[entity_id]
             return FakeState(value, attrs)
         return None
+
+    def _entity_ids(self, domain=None):
+        return [e for e in self.states if domain is None or e.startswith(domain + ".")]
 
     def _set_state(self, entity_id, value, new_attributes=None):
         self.state_sets.append((entity_id, value, new_attributes or {}))
@@ -396,7 +390,7 @@ class App:
         return self
 
     def capture_ops(self, ok=True):
-        """Replace the SolisCloud layer with a recorder of the batches the app applies."""
+        """Replace the Solis Modbus layer with a recorder of the batches the app applies."""
         self.ops = []
         results = list(ok) if isinstance(ok, (list, tuple)) else None
 

@@ -1,13 +1,13 @@
 """The arbiter: every feature on at once, and the clashes the separate apps used to have."""
 import unittest
 
-from tests.harness import (App, CHARGE_SWITCH_CIDS, CHARGE_TIME_CIDS, CURRENT_CID, EV_CONFIG, HH_CONFIG,
-                           SOC_CID, SWITCH_CID, TIME_CID, event, hh_event)
+from tests.harness import (App, CHARGE_SWITCHES, CHARGE_TIMES, EXPORT_CURRENT, EV_CONFIG, HH_CONFIG,
+                           EXPORT_SOC, EXPORT_SWITCH, EXPORT_TIME, event, hh_event)
 
-EV_TIME, EV_SWITCH = CHARGE_TIME_CIDS[1], CHARGE_SWITCH_CIDS[1]
-HH_TIME, HH_SWITCH = CHARGE_TIME_CIDS[2], CHARGE_SWITCH_CIDS[2]
-EXPORT_OFF = [("switch", SWITCH_CID, False), ("value", TIME_CID, "00:00-00:00")]
-EV_OFF = [("switch", EV_SWITCH, False), ("value", EV_TIME, "00:00-00:00")]
+EV_TIME, EV_SWITCH = CHARGE_TIMES[1], CHARGE_SWITCHES[1]
+HH_TIME, HH_SWITCH = CHARGE_TIMES[2], CHARGE_SWITCHES[2]
+EXPORT_OFF = [("switch", EXPORT_SWITCH, False), ("time", EXPORT_TIME, "00:00-00:00")]
+EV_OFF = [("switch", EV_SWITCH, False), ("time", EV_TIME, "00:00-00:00")]
 
 
 def all_app(extra=None, day=6):
@@ -28,7 +28,7 @@ def all_app(extra=None, day=6):
     return app
 
 
-def cids(batch):
+def ids(batch):
     return [op[1] for op in batch]
 
 
@@ -37,14 +37,14 @@ class EvVersusExportTests(unittest.TestCase):
         app = all_app()
         app.at("15:45")
         app.reconcile()
-        self.assertEqual(app.ops[-1][0], ("value", TIME_CID, "16:00-19:00"))
+        self.assertEqual(app.ops[-1][0], ("time", EXPORT_TIME, "16:00-19:00"))
 
         # Car starts charging mid-peak: export off first, then the EV slot on, in one batch.
         app.ops.clear()
         app.set_charger()
         app.at("16:40")
         app.reconcile()
-        self.assertEqual(app.ops, [EXPORT_OFF + [("value", EV_TIME, "16:30-17:00"), ("switch", EV_SWITCH, True)]])
+        self.assertEqual(app.ops, [EXPORT_OFF + [("time", EV_TIME, "16:30-17:00"), ("switch", EV_SWITCH, True)]])
         self.assertEqual(app.status()[1], "paused")
         self.assertIn("EV charging", app.overview()[2]["decision"])
 
@@ -60,8 +60,8 @@ class EvVersusExportTests(unittest.TestCase):
         app.reconcile()
         batch = app.ops[0]
         self.assertEqual(batch[:2], EV_OFF)
-        self.assertEqual(batch[2], ("value", TIME_CID, "16:00-19:00"))
-        self.assertEqual(batch[-1], ("switch", SWITCH_CID, True))
+        self.assertEqual(batch[2], ("time", EXPORT_TIME, "16:00-19:00"))
+        self.assertEqual(batch[-1], ("switch", EXPORT_SWITCH, True))
         self.assertEqual(app.status()[1], "exporting")
 
     def test_ev_dispatch_pauses_power_down(self):
@@ -70,7 +70,7 @@ class EvVersusExportTests(unittest.TestCase):
         app.set_charger()
         app.at("17:10")
         app.reconcile()
-        self.assertEqual(app.ops, [[("value", EV_TIME, "17:00-17:30"), ("switch", EV_SWITCH, True)]])
+        self.assertEqual(app.ops, [[("time", EV_TIME, "17:00-17:30"), ("switch", EV_SWITCH, True)]])
         self.assertEqual(app.status()[1], "paused")
         self.assertEqual(app.active(), "on")  # still a Power Down session, just not exporting
 
@@ -79,7 +79,7 @@ class EvVersusExportTests(unittest.TestCase):
         app.set_events(joined=[event("17:00", "18:00")])
         app.at("16:45")
         app.reconcile()
-        self.assertEqual(cids(app.ops[0]), [TIME_CID, CURRENT_CID, SOC_CID, SWITCH_CID])
+        self.assertEqual(ids(app.ops[0]), [EXPORT_TIME, EXPORT_CURRENT, EXPORT_SOC, EXPORT_SWITCH])
 
 
 class AxleTests(unittest.TestCase):
@@ -130,7 +130,7 @@ class HappyHourTests(unittest.TestCase):
         app.reconcile()
         batch = app.ops[0]
         self.assertEqual(batch[:2], EXPORT_OFF)
-        self.assertEqual(batch[2], ("value", HH_TIME, "16:30-17:30"))
+        self.assertEqual(batch[2], ("time", HH_TIME, "16:30-17:30"))
         self.assertEqual(batch[-1], ("switch", HH_SWITCH, True))
         self.assertIn("happy hour", app.overview()[2]["decision"])
 
@@ -140,8 +140,8 @@ class HappyHourTests(unittest.TestCase):
         app.set_happy_hours(booked=[hh_event("17:00", "18:00")])
         app.at("16:58", day=10)
         app.reconcile()
-        self.assertNotIn(HH_SWITCH, cids(app.ops[0]))
-        self.assertIn(SWITCH_CID, cids(app.ops[0]))
+        self.assertNotIn(HH_SWITCH, ids(app.ops[0]))
+        self.assertIn(EXPORT_SWITCH, ids(app.ops[0]))
         self.assertIn("Power Down", app.overview()[2]["decision"])
 
     def test_ev_and_happy_hour_both_charge(self):
@@ -155,59 +155,50 @@ class HappyHourTests(unittest.TestCase):
 
 
 class SharedClientTests(unittest.TestCase):
-    def real_cloud_app(self):
-        app = App(EV_CONFIG, HH_CONFIG, {"peak_export": True, "sync_inverter_time": False,
-                                         "ev_follow": {"debounce_seconds": 0}})
+    def real_modbus_app(self):
+        app = App(EV_CONFIG, HH_CONFIG, {"peak_export": True, "ev_follow": {"debounce_seconds": 0}})
         app.set_events()
         app.set_happy_hours()
         app.set_charger()
         app.at("14:12")
         return app
 
-    def test_one_login_and_one_switch_read_per_pass(self):
-        app = self.real_cloud_app()
+    def test_one_batch_per_pass(self):
+        app = self.real_modbus_app()
         app.reconcile("startup")
         # Every slot was unknown: core, EV (charging now), happy hour and export all written.
-        written = [w[0] for w in app.cloud.control_writes()]
-        for cid in (CHARGE_TIME_CIDS[0], EV_TIME, HH_TIME, TIME_CID):
-            self.assertIn(cid, written)
-        self.assertEqual(len(app.cloud.logins()), 1)
-        self.assertEqual(app.cloud.paths().count("/v2/api/atReadBatch"), 1)
+        written = app.modbus.written()
+        for times in (CHARGE_TIMES[0], EV_TIME, HH_TIME, EXPORT_TIME):
+            for entity in times:
+                self.assertIn(entity, written)
+        self.assertEqual(app.g["_flags"]["write_batches"], 1)
 
-    def test_switch_masks_chain_within_a_batch(self):
-        app = self.real_cloud_app()
+    def test_switches_already_off_are_not_written(self):
+        app = self.real_modbus_app()
         app.reconcile("startup")
-        switch_writes = [w for w in app.cloud.control_writes() if w[0] in CHARGE_SWITCH_CIDS + [SWITCH_CID]]
-        # Each switch write carries the mask including the ones before it in the batch.
-        self.assertEqual([w[0] for w in switch_writes], [CHARGE_SWITCH_CIDS[0], EV_SWITCH])
-        masks = [int(w[2]) for w in switch_writes]
-        bits = {CHARGE_SWITCH_CIDS[0]: 1 << 0, EV_SWITCH: 1 << 1}
-        expected = 0
-        for (cid, value, _), mask in zip(switch_writes, masks):
-            self.assertEqual(mask, expected)
-            if value == "1":
-                expected |= bits.get(cid, 0)
-            else:
-                expected &= ~bits.get(cid, 0)
+        switch_writes = [w for w in app.modbus.writes() if w[0] in CHARGE_SWITCHES + [EXPORT_SWITCH]]
+        # All switches start off: only the core and EV slots are switched on.
+        self.assertEqual(switch_writes, [(CHARGE_SWITCHES[0], "on"), (EV_SWITCH, "on")])
+        self.assertEqual(app.states[EV_SWITCH][0], "on")
 
     def test_write_lock_waits_for_the_other_writer(self):
-        app = self.real_cloud_app()
+        app = self.real_modbus_app()
         app.g["_flags"]["write_lock"] = True
 
         def release(_):
             app.g["_flags"]["write_lock"] = False
 
         app.asyncio.on_sleep = release
-        ok = app.run(app.solis_apply([("value", TIME_CID, "00:00-00:00")]))
+        ok = app.run(app.solis_apply([("time", EXPORT_TIME, "00:00-00:00")]))
         self.assertTrue(ok)
         self.assertEqual(app.asyncio.sleeps[0], 0.5)
         self.assertFalse(app.g["_flags"]["write_lock"])
 
     def test_lock_released_after_failure(self):
-        app = self.real_cloud_app()
-        app.cloud.fail_cids.add(TIME_CID)
+        app = self.real_modbus_app()
+        app.modbus.fail.add(EXPORT_TIME[0])
         app.g["_flags"]["write_lock"] = False
-        ok = app.run(app.solis_apply([("value", TIME_CID, "00:00-00:00")]))
+        ok = app.run(app.solis_apply([("time", EXPORT_TIME, "00:00-00:00")]))
         self.assertFalse(ok)
         self.assertFalse(app.g["_flags"]["write_lock"])
 

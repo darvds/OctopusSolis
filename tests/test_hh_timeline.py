@@ -1,10 +1,11 @@
 import unittest
 
-from tests.hh_harness import (App, CURRENT_CID, SOC_CID, SWITCH_CID, TIME_CID, WATER_HEATER, booked, local)
+from tests.harness import charge_slot
+from tests.hh_harness import (App, CURRENT, CUTOFF_SOC, SWITCH, TIME, WATER_HEATER, booked, local)
 
-ARM = [("value", TIME_CID, "14:00-15:00"), ("value", CURRENT_CID, "100"),
-       ("value", SOC_CID, "100"), ("switch", SWITCH_CID, True)]
-CLEAR = [("switch", SWITCH_CID, False), ("value", TIME_CID, "00:00-00:00")]
+ARM = [("time", TIME, "14:00-15:00"), ("value", CURRENT, "100"),
+       ("value", CUTOFF_SOC, "100"), ("switch", SWITCH, True)]
+CLEAR = [("switch", SWITCH, False), ("time", TIME, "00:00-00:00")]
 
 ACTIONS = {
     "start_actions": [
@@ -97,7 +98,7 @@ class TimelineTests(unittest.TestCase):
         app.reconcile()
         self.assertEqual([b["data"]["hours"] * 60 + b["data"]["minutes"] for b in app.services.boosts()],
                          [60, 105])
-        self.assertEqual(app.ops[0][0], ("value", TIME_CID, "14:00-16:00"))
+        self.assertEqual(app.ops[0][0], ("time", TIME, "14:00-16:00"))
         self.assertEqual(app.services.titles(), ["Happy Hour started"])
 
     def test_boost_failure_retries(self):
@@ -158,18 +159,19 @@ class TimelineTests(unittest.TestCase):
         app = happy_app({"charge_slot": 5, "charge_current": 70, "charge_soc": 90, "prepare_minutes": 15})
         app.at("13:45")
         app.reconcile()
-        self.assertEqual(app.ops, [[("value", "5958", "14:00-15:00"), ("value", "5960", "70"),
-                                    ("value", "5932", "90"), ("switch", "5920", True)]])
+        times, current, soc, switch = charge_slot(5)
+        self.assertEqual(app.ops, [[("time", times, "14:00-15:00"), ("value", current, "70"),
+                                    ("value", soc, "90"), ("switch", switch, True)]])
 
 
 class FeatureToggleTests(unittest.TestCase):
-    def test_no_solis_credentials_means_no_battery(self):
-        with self.assertLogs("pyscript.solis_octopus", level="ERROR"):
-            app = App({"key_id": None, "battery_charge": True})
+    def test_no_inverter_control_means_no_battery(self):
+        with self.assertLogs("pyscript.solis_octopus", level="WARNING"):
+            app = App({"inverter_control": False, "battery_charge": True})
         self.assertFalse(app.BATTERY_CHARGE)
 
-    def test_battery_off_by_default_without_credentials(self):
-        app = App({"key_id": None, "secret": None})
+    def test_happy_hours_still_run_without_inverter_control(self):
+        app = App({"inverter_control": False})
         self.assertFalse(app.BATTERY_CHARGE)
         app.capture_ops()
         app.set_events(booked=[booked("14:00", "15:00")])
@@ -220,7 +222,7 @@ class DiagnosticsTests(unittest.TestCase):
             app.reconcile()
         self.assertTrue(any("would write" in line for line in logs.output))
         self.assertTrue(any("would call octopus_energy.boost_water_heater" in line for line in logs.output))
-        self.assertEqual(app.cloud.calls, [])
+        self.assertEqual(app.modbus.calls, [])
         self.assertEqual(app.services.boosts(), [])
         self.assertEqual(app.services.others(), [])
         self.assertIn("diagnostics only", app.services.notifications()[0]["data"]["message"])
