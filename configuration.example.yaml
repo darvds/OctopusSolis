@@ -54,6 +54,9 @@ pyscript:
         export_limit_kw: 3.68   # your DNO export limit
         discharge_efficiency: 0.95
         min_export_kw: 0.2      # don't force a discharge that would barely export
+        # Exports run at full rate at the end of a window, with self-use before.
+        export_start_step_minutes: 5
+        export_keep_start_rate: 0.8   # don't move a written start while >= 80% of full rate works
         current_step_amps: 5
         prepare_minutes: 15     # write the discharge slot this long before a window
 

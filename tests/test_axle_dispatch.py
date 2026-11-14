@@ -85,7 +85,10 @@ class ExportTests(unittest.TestCase):
         # Keeping 18:30-23:30 at 0.5 kW on top of the floor.
         self.assertEqual(k["reserve_kwh"], 3.5)
         self.assertEqual(k["stop_soc"], 35)
-        self.assertEqual(k["discharge_current"], 88)
+        # Self-use for 5 minutes, then 95 A to the end of the event.
+        self.assertEqual(k["export_window"], "17:35-18:30")
+        self.assertEqual(k["discharge_current"], 95)
+        self.assertEqual(d["discharge_current"], 100)
         self.assertGreater(d["predicted_export_kwh"], k["predicted_export_kwh"])
 
     def test_earlier_peak_holds_back(self):

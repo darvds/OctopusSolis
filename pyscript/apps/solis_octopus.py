@@ -13,6 +13,8 @@ so features never overwrite each other on the inverter:
   back to its normal window (e.g. 23:30-05:30) afterwards.
 - Power Down: export during Octoplus Power Down sessions, sized so the battery
   still covers the house until the cheap overnight window (discharge slot 1).
+  Self-use first, then full rate to the end of the window: a slow forced
+  discharge would let the grid cover every load spike above it.
 - Peak export: the same, every day in a peak export window (e.g. 16:00-19:00).
 - Axle Energy: Axle drives the battery itself during its events; the app holds
   battery back beforehand and keeps off the inverter while they run.
@@ -49,7 +51,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 log = logging.getLogger("pyscript.solis_octopus")
 log.setLevel(logging.DEBUG)
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # -----------------------------
 # SolisCloud endpoints / constants
@@ -205,6 +207,11 @@ DISCHARGE_EFFICIENCY = float(BAT.get("discharge_efficiency", 0.95))
 MIN_EXPORT_KW = float(BAT.get("min_export_kw", 0.2))
 CURRENT_STEP_AMPS = int(BAT.get("current_step_amps", 5))
 EXPORT_PREPARE_MINUTES = int(BAT.get("prepare_minutes", 15))
+# The full-rate export starts on a multiple of this many minutes. A start
+# already on the inverter is kept, rather than moved later, while the slot can
+# still run at this share of full rate from it.
+EXPORT_START_STEP_MINUTES = max(1, int(BAT.get("export_start_step_minutes", 5)))
+EXPORT_KEEP_START_RATE = float(BAT.get("export_keep_start_rate", 0.8))
 
 # --- EV-Follow ---
 EV_ENABLED = _cfg_bool("enabled", bool(EVC), EVC)
@@ -358,6 +365,8 @@ _hh_seen = {"announced": set(), "running": {}}
 _ev = {"start": None, "end": None, "charging_since": None, "debounced": False, "last_charging": None,
        "info": {}}
 _last = {"plan": None, "export_window": None, "hh_window": None, "decision": None}
+# The export we programmed: its window id and when its full-rate discharge starts.
+_export_run = {"id": None, "start": None}
 # Renault: the schedule we last set on the car (None = unknown, e.g. after a
 # restart, so it's written), and the retry state for the one we want.
 _car = {"applied": None, "applied_mode": None, "wanted": None, "failed_at": None, "failures": 0,
@@ -1196,13 +1205,22 @@ def solar_forecast():
     return out
 
 
-def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_to_floor=False):
+def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_to_floor=False,
+            programmed_start=None):
     """
     Plan the export for the window `session`. All energies in kWh, powers in kW.
     `soc` is the battery SOC now (%), `load_profile` {local hour: kW},
     `solar` {UTC half-hour: kW}, `later` the windows after it and before the
     cheap window (battery is held back for Power Down ones). `drain_to_floor`
     leaves out the evening reserve (Axle export events).
+
+    While a timed discharge slot runs, the Solis holds the battery at the slot's
+    current and the grid covers any house load above it. So the export isn't
+    spread thinly over the window: the inverter stays in self-use (the battery
+    covers the house) until `export_start`, then discharges at full rate until
+    the window ends, at the reserve. `programmed_start` is the start already
+    on the inverter: once it has begun, the current is re-planned to land on
+    the reserve at the end of the window, without moving the start.
     """
     cap = BATTERY_CAPACITY_KWH
 
@@ -1268,22 +1286,78 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_t
         solar_kwh += solar_kw(t) * h
 
     spare_kwh = max(0.0, battery_at_start - reserve_kwh)
+    full_kw = 0.0
     if hours > 0:
         # Battery power that would push exactly the export limit out.
         export_cap_kw = max(0.0, (EXPORT_LIMIT_KW + (load_kwh - solar_kwh) / hours) / DISCHARGE_EFFICIENCY)
-        power_kw = min(spare_kwh / hours, MAX_DISCHARGE_KW, export_cap_kw)
-    else:
-        power_kw = 0.0
+        full_kw = min(MAX_DISCHARGE_KW, MAX_DISCHARGE_AMPS * volts / 1000.0, export_cap_kw)
+
+    def self_use(a, b):
+        """Battery used in self-use over [a, b): the house, less any solar surplus it soaks up."""
+        total = 0.0
+        for t, h in periods(a, b):
+            total += (load_kw(t) - solar_kw(t)) * h
+        return total
+
+    # When the full-rate discharge starts: self-use before it uses the house's
+    # net load, full rate after it uses full_kw, and together they use the spare.
+    export_start = end
+    if hours > 0 and full_kw > 0:
+        if full_kw * hours <= spare_kwh:
+            export_start = start
+        elif self_use(start, end) < spare_kwh:
+            used = self_use(start, end)
+            export_start = start
+            for t, h in reversed(session_periods):
+                gain = full_kw - (load_kw(t) - solar_kw(t))
+                if gain > 0 and used + gain * h >= spare_kwh:
+                    export_start = t + timedelta(hours=h - (spare_kwh - used) / gain)
+                    break
+                used += gain * h
+            # Round down to a whole step. The current below then comes out a
+            # little under full rate, so the battery still ends at the reserve.
+            local = to_local(export_start).replace(second=0, microsecond=0)
+            local -= timedelta(minutes=local.minute % EXPORT_START_STEP_MINUTES)
+            export_start = max(start, local)
+
+    def rate_from(a):
+        """The battery power that lands on the reserve at the end, full rate from `a`."""
+        hrs = 0.0
+        for _, h in periods(a, end):
+            hrs += h
+        if hrs <= 0:
+            return 0.0
+        return max(0.0, min(full_kw, (spare_kwh - self_use(start, a)) / hrs))
+
+    # Keep the start already on the inverter once it has begun, or when the
+    # plan moves it later but the slot can still run near full rate from it
+    # (no rewrite for every small change in SOC).
+    slot_start = session["start"] if export_start <= start else export_start
+    if programmed_start is not None and session["start"] <= programmed_start < end:
+        if programmed_start <= start or (
+                programmed_start <= export_start < end
+                and rate_from(programmed_start) >= EXPORT_KEEP_START_RATE * full_kw):
+            export_start = max(start, programmed_start)
+            slot_start = programmed_start
+    forced_periods = periods(export_start, end)
+    forced_hours = 0.0
+    for _, h in forced_periods:
+        forced_hours += h
+    power_kw = rate_from(export_start)
 
     current = 0
     if power_kw > 0:
         current = min(MAX_DISCHARGE_AMPS, int(math.ceil(power_kw * 1000.0 / volts - 1e-6)))
     power_kw = min(power_kw, current * volts / 1000.0)
 
+    # Self-use before export_start: the battery covers the house (and soaks up
+    # any solar surplus) as far as the spare goes, the grid the rest. Full
+    # rate after it.
+    self_use_kwh = self_use(start, max(start, export_start))
     export_kwh = 0.0
-    import_kwh = 0.0
+    import_kwh = max(0.0, self_use_kwh - spare_kwh)
     value_pence = 0.0
-    for t, h in session_periods:
+    for t, h in forced_periods:
         net = power_kw * DISCHARGE_EFFICIENCY + solar_kw(t) - load_kw(t)
         exported = min(EXPORT_LIMIT_KW, max(0.0, net)) * h
         export_kwh += exported
@@ -1291,6 +1365,7 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_t
         rate = export_rate_at(t)
         if rate is not None:
             value_pence += exported * rate
+    battery_used_kwh = power_kw * forced_hours + max(0.0, min(spare_kwh, self_use_kwh))
 
     stop_soc = int(math.ceil(reserve_kwh / cap * 100.0 - 1e-6)) if cap > 0 else 100
     stop_soc = max(FLOOR_SOC, min(100, stop_soc))
@@ -1308,28 +1383,31 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_t
         "held_for_power_down_kwh": round(held_kwh, 2),
         "evening_load_kwh": round(evening_kwh, 2),
         "spare_kwh": round(spare_kwh, 2),
-        "battery_used_kwh": round(power_kw * hours, 2),
+        "battery_used_kwh": round(battery_used_kwh, 2),
         "discharge_kw": round(power_kw, 2),
         "discharge_current": current,
+        "export_start": slot_start.isoformat(),
+        "export_window": fmt_window(slot_start, session["end"]) if forced_hours > 0 else None,
+        "export_hours": round(forced_hours, 3),
         "stop_soc": stop_soc,
         "predicted_house_load_kwh": round(load_kwh, 2),
         "predicted_solar_kwh": round(solar_kwh, 2),
         "predicted_export_kwh": round(export_kwh, 2),
-        "predicted_export_kw": round(export_kwh / hours, 2) if hours > 0 else 0.0,
+        "predicted_export_kw": round(export_kwh / forced_hours, 2) if forced_hours > 0 else 0.0,
         "predicted_import_kwh": round(import_kwh, 2),
         "estimated_octopoints": int(round(avoided_kwh * session.get("octopoints_per_kwh", 0))),
         "estimated_export_value_pence": round(value_pence, 1),
     }
 
 
-async def plan_for(session, now, later=None, drain_to_floor=False):
+async def plan_for(session, now, later=None, drain_to_floor=False, programmed_start=None):
     soc = _float_state(SOC_SENSOR)
     if soc is None:
         log.warning("SOC sensor '%s' unavailable; can't plan", SOC_SENSOR)
         return None
     voltage = _float_state(BATTERY_VOLTAGE_SENSOR)
     profile = await ensure_load_profile()
-    return predict(session, now, soc, voltage, profile, solar_forecast(), later, drain_to_floor)
+    return predict(session, now, soc, voltage, profile, solar_forecast(), later, drain_to_floor, programmed_start)
 
 
 def worth_exporting(plan):
@@ -1341,6 +1419,21 @@ def worth_exporting(plan):
     return plan["discharge_current"] > 0 and plan["predicted_export_kw"] >= MIN_EXPORT_KW
 
 
+def programmed_export_start(session):
+    """When the export slot we programmed for `session` starts, or None."""
+    if session is None or _export_run["id"] != session.get("id") or _export_run["start"] is None:
+        return None
+    if not _slots["export"]["enabled"] or _slots["export"]["unknown"]:
+        return None
+    return _export_run["start"]
+
+
+def export_started(session, now):
+    """The full-rate discharge we programmed for `session` has begun."""
+    start = programmed_export_start(session)
+    return start is not None and start <= now
+
+
 def export_desired(session, plan, now):
     """What the discharge slot should hold right now."""
     if session is None or plan is None or (is_axle(session) and not axle_dispatch(session)):
@@ -1349,11 +1442,13 @@ def export_desired(session, plan, now):
         return {"window": EMPTY_SLOT, "current": None, "soc": None, "enabled": False}
     if not worth_exporting(plan):
         return {"window": EMPTY_SLOT, "current": None, "soc": None, "enabled": False}
+    start = parse_dt(plan.get("export_start")) or session["start"]
     return {
-        "window": fmt_window(session["start"], session["end"]),
+        "window": fmt_window(start, session["end"]),
         "current": plan["discharge_current"],
         "soc": plan["stop_soc"],
         "enabled": True,
+        "start": start,
     }
 
 
@@ -2070,7 +2165,8 @@ async def _reconcile(reason):
     plan = None
     if export_window is not None and (not is_axle(export_window) or axle_dispatch(export_window)):
         plan = await plan_for(export_window, now, later,
-                              drain_to_floor=axle_dispatch(export_window) and not AXLE_KEEP_RESERVE)
+                              drain_to_floor=axle_dispatch(export_window) and not AXLE_KEEP_RESERVE,
+                              programmed_start=programmed_export_start(export_window))
     export_want = export_desired(export_window, plan, now)
 
     axle_running = stand_aside(export_window, now)
@@ -2115,6 +2211,11 @@ async def _reconcile(reason):
             for key in per_slot:
                 if per_slot[key]:
                     apply_slot_ops(key, per_slot[key], ends.get(key))
+            if per_slot.get("export"):
+                if wants["export"]["enabled"] and export_window is not None:
+                    _export_run["id"], _export_run["start"] = export_window["id"], wants["export"]["start"]
+                else:
+                    _export_run["id"], _export_run["start"] = None, None
             if per_slot.get("ev"):
                 # EV-Follow remembers the window it programmed, so it can extend it.
                 if wants["ev"]["enabled"]:
@@ -2165,7 +2266,8 @@ async def after_write(now, wants, export_window, plan):
     await notify(
         title,
         f"{plan['window']}: exporting ~{plan['predicted_export_kwh']} kWh at "
-        f"{plan['discharge_current']} A, stopping at {plan['stop_soc']}% "
+        f"{plan['discharge_current']} A from {fmt_window(wants['export']['start'], export_window['end'])}, "
+        f"stopping at {plan['stop_soc']}% "
         f"({plan['reserve_kwh']} kWh kept {kept}).",
     )
 
@@ -2194,7 +2296,7 @@ def _slot_attrs(key):
 def publish_overview(now, export_window, hh_window):
     if stand_aside(export_window, now):
         state_value = "axle_event"
-    elif _slots["export"]["enabled"] and export_window is not None and export_window["start"] <= now:
+    elif export_started(export_window, now):
         state_value = "exporting"
     elif (_slots["ev"]["enabled"] and _ev["end"] is not None and now < _ev["end"]) or \
             (_slots["happy_hour"]["enabled"] and is_running(hh_window, now)):
@@ -2317,7 +2419,7 @@ def publish_export_status(session, plan, now, events_status="ok", axle_status="d
         status = "paused"
     elif plan is not None and not worth_exporting(plan):
         status = "no_spare_energy"
-    elif running and program["enabled"]:
+    elif running and export_started(session, now):
         status = "exporting"
     elif program["enabled"]:
         status = "armed"

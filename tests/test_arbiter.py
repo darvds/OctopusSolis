@@ -37,7 +37,7 @@ class EvVersusExportTests(unittest.TestCase):
         app = all_app()
         app.at("15:45")
         app.reconcile()
-        self.assertEqual(app.ops[-1][0], ("value", TIME_CID, "16:00-19:00"))
+        self.assertEqual(app.ops[-1][0], ("value", TIME_CID, "16:35-19:00"))
 
         # Car starts charging mid-peak: export off first, then the EV slot on, in one batch.
         app.ops.clear()

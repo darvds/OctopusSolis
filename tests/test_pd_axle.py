@@ -111,7 +111,7 @@ class AxleStandAsideTests(unittest.TestCase):
         app.set_soc(100)
         app.at("15:45")
         app.reconcile()
-        self.assertEqual(app.ops[-1][0], ("value", TIME_CID, "16:00-17:30"))
+        self.assertEqual(app.ops[-1][0], ("value", TIME_CID, "16:15-17:30"))
         for hhmm in ("17:30", "17:45", "18:30", "18:35"):
             with self.subTest(time=hhmm):
                 app.ops.clear()
@@ -135,7 +135,7 @@ class AxleStandAsideTests(unittest.TestCase):
         app.set_soc(100)
         app.at("15:45")
         app.reconcile()
-        self.assertEqual(app.ops[-1][0], ("value", TIME_CID, "16:00-19:00"))
+        self.assertEqual(app.ops[-1][0], ("value", TIME_CID, "17:50-19:00"))
         app.ops.clear()
         app.set_axle("export", "17:30", "18:30")
         app.at("17:35")

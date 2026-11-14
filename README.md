@@ -47,7 +47,13 @@ Before an Axle export event or a Power Down session, earlier export windows **ho
 - the battery at the start
 - the reserve the house needs until the cheap window
 
-Everything above the reserve is exported, capped by your inverter, battery current and export limit. The slot is written `prepare_minutes` before the window. During the window it's re-planned every minute from the real SOC.
+Everything above the reserve is exported, capped by your inverter, battery current and export limit. The export isn't spread thinly over the window. While a Solis timed discharge slot runs, the battery holds the slot's current, and the grid covers any house load above it. A slow, spread-out discharge would import every time the kettle or oven went on. Instead:
+- the inverter stays in **self-use** for the first part of the window, so the battery covers the house as usual
+- it discharges at **full rate** for the last part (up to your export limit plus the house), timed so the battery reaches the reserve as the window ends
+
+So the grid only covers house load above roughly the full discharge rate. The planned full-rate part shows as `export_window` (the session itself is `window`).
+
+The slot is written `prepare_minutes` before the window, starting at the full-rate part. Every minute it's re-planned from the real SOC. Before the full-rate part begins, its start moves if the house uses more or less than predicted. It isn't moved later while the slot can still run at `export_keep_start_rate` of full rate from the start already written, so the inverter isn't rewritten for every 1% of SOC. Once the full-rate part is running, its start stays put and only the current is adjusted, so the battery ends at the reserve.
 
 **Axle Energy.** See [Axle Energy](#axle-energy) below.
 
@@ -65,7 +71,7 @@ The app reads the [Axle Energy integration](https://www.home-assistant.io/integr
 In both modes Axle pays the same way: it credits *"whatever you export to the grid during the scheduled event window"*. Standard events are announced the day before, and short-notice events, which you opt into, come 2 hours ahead. Event times never change once an event has started.
 
 **With `control: true` (Self-Dispatch)**
-- **Export events** are planned like any other export window and written `prepare_minutes` before the event. The battery exports everything above the **floor** (`battery.floor_soc`), spread over the event and capped by your inverter, battery current and export limit.
+- **Export events** are planned like any other export window and written `prepare_minutes` before the event. The battery exports everything above the **floor** (`battery.floor_soc`), at full rate towards the end of the event (self-use before that), capped by your inverter, battery current and export limit.
   - The usual evening reserve isn't kept, because Axle's payment per kWh normally beats what the evening costs. Set `keep_evening_reserve: true` to keep it.
   - Battery is still held back for a later Power Down session before the cheap window.
 - **Before an event**, earlier peak and Power Down windows hold back what the event can export.
@@ -179,6 +185,8 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 | `export_limit_kw` | `3.68` | Your export limit |
 | `discharge_efficiency` | `0.95` | Battery-to-AC efficiency |
 | `min_export_kw` | `0.2` | Only export when it exports at least this rate |
+| `export_start_step_minutes` | `5` | The full-rate export starts on a multiple of this many minutes |
+| `export_keep_start_rate` | `0.8` | Keep an already-written start while the slot can still run at this share of full rate from it |
 | `current_step_amps` | `5` | Minimum change before the current is rewritten |
 | `prepare_minutes` | `15` | Write the discharge slot this long before a window |
 

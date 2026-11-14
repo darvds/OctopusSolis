@@ -2,7 +2,8 @@ import unittest
 
 from tests.harness import (App, CURRENT_CID, SOC_CID, SWITCH_CID, TIME_CID, event)
 
-ARM = [("value", TIME_CID, "17:00-18:00"), ("value", CURRENT_CID, "35"),
+# Self-use to 17:40, then 85 A (4.25 kW) to the end of the session.
+ARM = [("value", TIME_CID, "17:40-18:00"), ("value", CURRENT_CID, "85"),
        ("value", SOC_CID, "38"), ("switch", SWITCH_CID, True)]
 CLEAR = [("switch", SWITCH_CID, False), ("value", TIME_CID, "00:00-00:00")]
 
@@ -24,11 +25,14 @@ class SessionScenarioTests(unittest.TestCase):
             ("16:40", 56.25, [], "planned"),
             ("16:45", 56.25, [ARM], "armed"),
             ("16:50", 56.25, [], "armed"),
-            ("17:00", 56.25, [], "exporting"),
-            # Discharging on plan: 5.5 - 0.5 h x 1.75 = 4.625 kWh, still ~35 A.
-            ("17:30", 46.25, [], "exporting"),
+            # Self-use: the battery covers the house, the slot waits for 17:40.
+            ("17:00", 55, [], "armed"),
+            ("17:30", 52.5, [], "armed"),
+            ("17:40", 51.7, [], "exporting"),
+            # Discharging on plan: 5.17 - 1/6 h x 4.25 = 4.46 kWh, still ~85 A.
+            ("17:50", 44.6, [], "exporting"),
             # Running hot (SOC lower than planned): current drops by >= 5 A.
-            ("17:30", 42, [[("value", CURRENT_CID, "18")]], "exporting"),
+            ("17:50", 42, [[("value", CURRENT_CID, "54")]], "exporting"),
             ("18:00", 38, [CLEAR], "idle"),
             ("18:05", 38, [], "idle"),
         ]
@@ -50,6 +54,38 @@ class SessionScenarioTests(unittest.TestCase):
         app.reconcile()
         self.assertEqual(app.active(), "on")
 
+    def test_programmed_start_not_rewritten_every_minute(self):
+        app = armed_app()
+        app.g["_slots"]["export"]["unknown"] = False
+        app.at("16:45")
+        app.set_soc(56.25)
+        app.reconcile()
+        # The house uses a little more than predicted: on its own the plan
+        # would start later, but 17:40 still runs near full rate.
+        writes = []
+        for hhmm, soc in [("17:00", 54.9), ("17:10", 54.0), ("17:20", 53.2), ("17:30", 52.2)]:
+            app.ops.clear()
+            app.at(hhmm)
+            app.set_soc(soc)
+            app.reconcile()
+            writes += [op for batch in app.ops for op in batch if op[1] == TIME_CID]
+        self.assertEqual(writes, [])
+        self.assertEqual(app.status()[2]["programmed_window"], "17:40-18:00")
+
+    def test_overview_says_exporting_only_at_full_rate(self):
+        app = armed_app()
+        app.at("16:45")
+        app.set_soc(56.25)
+        app.reconcile()
+        app.at("17:20")
+        app.set_soc(53.3)
+        app.reconcile()
+        self.assertEqual(app.overview()[1], "idle")
+        app.at("17:45")
+        app.set_soc(49)
+        app.reconcile()
+        self.assertEqual(app.overview()[1], "exporting")
+
     def test_small_current_changes_are_not_written(self):
         app = armed_app()
         app.at("16:45")
@@ -59,7 +95,7 @@ class SessionScenarioTests(unittest.TestCase):
         app.set_soc(56)  # a few amps less
         app.reconcile()
         self.assertEqual(app.ops, [])
-        self.assertEqual(app.status()[2]["programmed_current"], 35)
+        self.assertEqual(app.status()[2]["programmed_current"], 85)
 
     def test_startup_clears_leftover_slot(self):
         app = App()
@@ -72,10 +108,10 @@ class SessionScenarioTests(unittest.TestCase):
 
     def test_startup_mid_session_writes_everything(self):
         app = armed_app()
-        app.at("17:30")
-        app.set_soc(46.25)
+        app.at("17:50")
+        app.set_soc(44.6)
         app.reconcile("startup")
-        self.assertEqual(app.ops, [[("value", TIME_CID, "17:00-18:00"), ("value", CURRENT_CID, "35"),
+        self.assertEqual(app.ops, [[("value", TIME_CID, "17:00-18:00"), ("value", CURRENT_CID, "86"),
                                     ("value", SOC_CID, "38"), ("switch", SWITCH_CID, True)]])
 
     def test_no_spare_energy_leaves_slot_off(self):
@@ -107,7 +143,9 @@ class SessionScenarioTests(unittest.TestCase):
         attrs = app.status()[2]
         self.assertEqual(attrs["predicted_export_kwh"], 1.25)
         self.assertEqual(attrs["reserve_kwh"], 3.75)
-        self.assertEqual(attrs["programmed_window"], "17:00-18:00")
+        self.assertEqual(attrs["programmed_window"], "17:40-18:00")
+        self.assertEqual(attrs["export_window"], "17:40-18:00")
+        self.assertEqual(attrs["window"], "17:00-18:00")
         self.assertEqual(attrs["octopoints_per_kwh"], 800)
 
     def test_notifies_once_when_armed(self):
@@ -121,6 +159,7 @@ class SessionScenarioTests(unittest.TestCase):
         notes = app.services.notifications()
         self.assertEqual(len(notes), 1)
         self.assertIn("1.25 kWh", notes[0]["data"]["message"])
+        self.assertIn("85 A from 17:40-18:00", notes[0]["data"]["message"])
 
     def test_other_discharge_slot(self):
         app = armed_app({"discharge_slot": 2})
@@ -139,8 +178,8 @@ class SolisCloudTests(unittest.TestCase):
         ok = app.run(app.solis_apply(ARM))
         self.assertTrue(ok)
         self.assertEqual(app.cloud.control_writes(), [
-            (TIME_CID, "17:00-18:00", None),
-            (CURRENT_CID, "35", None),
+            (TIME_CID, "17:40-18:00", None),
+            (CURRENT_CID, "85", None),
             (SOC_CID, "38", None),
             (SWITCH_CID, "1", "1"),
         ])
