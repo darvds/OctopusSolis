@@ -1,9 +1,9 @@
 import unittest
 
-from tests.harness import SWITCH_CID, App, CURRENT_CID, SOC_CID, TIME_CID, event, local
+from tests.harness import EXPORT_SWITCH, App, EXPORT_CURRENT, EXPORT_SOC, EXPORT_TIME, event, local
 
 SWITCH = "input_boolean.solis_peak_export"
-CLEAR = [("switch", SWITCH_CID, False), ("value", TIME_CID, "00:00-00:00")]
+CLEAR = [("switch", EXPORT_SWITCH, False), ("time", EXPORT_TIME, "00:00-00:00")]
 
 
 def retarget(window, current, soc):
@@ -12,8 +12,8 @@ def retarget(window, current, soc):
 
 
 def arm(window, current, soc):
-    return [("value", TIME_CID, window), ("value", CURRENT_CID, str(current)),
-            ("value", SOC_CID, str(soc)), ("switch", SWITCH_CID, True)]
+    return [("time", EXPORT_TIME, window), ("value", EXPORT_CURRENT, str(current)),
+            ("value", EXPORT_SOC, str(soc)), ("switch", EXPORT_SWITCH, True)]
 
 
 def peak_app(config=None, joined=()):
@@ -203,7 +203,7 @@ class PeakScenarioTests(unittest.TestCase):
         self.run_steps(app, [
             ("15:45", 100, [arm("16:50-17:00", 85, 84)], "armed"),
             ("16:30", 96, [], "armed"),
-            ("16:50", 94, [[("value", CURRENT_CID, "78")]], "exporting"),
+            ("16:50", 94, [[("value", EXPORT_CURRENT, "78")]], "exporting"),
             ("17:00", 88, [retarget("17:00-18:00", 100, 34)], "exporting"),
             ("18:00", 43, [retarget("18:50-19:00", 76, 29)], "armed"),
             ("19:00", 33, [CLEAR], "no_spare_energy"),

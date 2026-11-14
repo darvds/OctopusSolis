@@ -1,11 +1,11 @@
 """EV-Follow: ported from SolisOctopusEVFollow, on the combined app."""
 import unittest
 
-from tests.harness import (App, CHARGE_SWITCH_CIDS, CHARGE_TIME_CIDS, CHARGER_CURRENT, CHARGER_SWITCH,
+from tests.harness import (App, CHARGE_SWITCHES, CHARGE_TIMES, CHARGER_CURRENT, CHARGER_SWITCH,
                            DISPATCH, EV_CONFIG, local)
 
-EV_TIME, EV_SWITCH = CHARGE_TIME_CIDS[1], CHARGE_SWITCH_CIDS[1]
-CORE_TIME, CORE_SWITCH = CHARGE_TIME_CIDS[0], CHARGE_SWITCH_CIDS[0]
+EV_TIME, EV_SWITCH = CHARGE_TIMES[1], CHARGE_SWITCHES[1]
+CORE_TIME, CORE_SWITCH = CHARGE_TIMES[0], CHARGE_SWITCHES[0]
 
 
 def ev_app(ev=None, extra=None, debounce=0):
@@ -21,14 +21,14 @@ def ev_app(ev=None, extra=None, debounce=0):
 
 
 def start(window):
-    return [("value", EV_TIME, window), ("switch", EV_SWITCH, True)]
+    return [("time", EV_TIME, window), ("switch", EV_SWITCH, True)]
 
 
 def extend(window):
-    return [("value", EV_TIME, window)]
+    return [("time", EV_TIME, window)]
 
 
-CLEAR = [("switch", EV_SWITCH, False), ("value", EV_TIME, "00:00-00:00")]
+CLEAR = [("switch", EV_SWITCH, False), ("time", EV_TIME, "00:00-00:00")]
 
 
 class RollingSlotScenarioTests(unittest.TestCase):
@@ -208,8 +208,8 @@ class WriteBehaviourTests(unittest.TestCase):
         app.set_charger()
         app.at("14:12")
         app.reconcile()
-        self.assertEqual(app.ops, [[("value", CHARGE_TIME_CIDS[4], "14:00-14:30"),
-                                    ("switch", CHARGE_SWITCH_CIDS[4], True)]])
+        self.assertEqual(app.ops, [[("time", CHARGE_TIMES[4], "14:00-14:30"),
+                                    ("switch", CHARGE_SWITCHES[4], True)]])
 
     def test_busy_flag_released_after_error(self):
         app = ev_app()
@@ -328,8 +328,8 @@ class CoreSlotTests(unittest.TestCase):
         app = self.fresh()
         app.reconcile()
         self.assertEqual(app.ops, [[
-            ("switch", EV_SWITCH, False), ("value", EV_TIME, "00:00-00:00"),
-            ("value", CORE_TIME, "23:30-05:30"), ("switch", CORE_SWITCH, True),
+            ("switch", EV_SWITCH, False), ("time", EV_TIME, "00:00-00:00"),
+            ("time", CORE_TIME, "23:30-05:30"), ("switch", CORE_SWITCH, True),
         ]])
         app.ops.clear()
         app.reconcile()
@@ -338,27 +338,27 @@ class CoreSlotTests(unittest.TestCase):
     def test_spaces_stripped_from_core_window(self):
         app = self.fresh(extra={"core_window": "23:30 - 05:30"})
         app.reconcile()
-        self.assertIn(("value", CORE_TIME, "23:30-05:30"), app.ops[0])
+        self.assertIn(("time", CORE_TIME, "23:30-05:30"), app.ops[0])
 
     def test_without_core_management(self):
         app = self.fresh({"manage_core_slot": False})
         app.reconcile()
-        self.assertEqual(app.ops, [[("switch", EV_SWITCH, False), ("value", EV_TIME, "00:00-00:00")]])
+        self.assertEqual(app.ops, [[("switch", EV_SWITCH, False), ("time", EV_TIME, "00:00-00:00")]])
 
     def test_other_charge_slots_left_alone_by_default(self):
         app = self.fresh()
         app.reconcile()
-        cids = [op[1] for op in app.ops[0]]
+        ids = [op[1] for op in app.ops[0]]
         for i in (2, 3, 4, 5):
-            self.assertNotIn(CHARGE_TIME_CIDS[i], cids)
+            self.assertNotIn(CHARGE_TIMES[i], ids)
 
     def test_clear_other_charge_slots_once(self):
         app = self.fresh(extra={"slots": {"clear_other_charge_slots": True}})
         app.reconcile()
-        cids = [op[1] for op in app.ops[0]]
+        ids = [op[1] for op in app.ops[0]]
         for i in (2, 3, 4, 5):
-            self.assertIn(CHARGE_TIME_CIDS[i], cids)
-            self.assertIn(CHARGE_SWITCH_CIDS[i], cids)
+            self.assertIn(CHARGE_TIMES[i], ids)
+            self.assertIn(CHARGE_SWITCHES[i], ids)
         app.ops.clear()
         app.reconcile()
         self.assertEqual(app.ops, [])
