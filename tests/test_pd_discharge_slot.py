@@ -188,6 +188,33 @@ class SessionScenarioTests(unittest.TestCase):
         self.assertEqual([op[1] for op in app.ops[0][:3]], ["5968", "5971", "5969"])
 
 
+class MissingCredentialsTests(unittest.TestCase):
+    """Your 14 Nov case: the plan showed, but nothing was ever written."""
+
+    def test_status_says_the_inverter_is_not_controlled(self):
+        app = App({"secret": ""})
+        app.capture_ops()
+        app.set_events(joined=[event("17:00", "18:00")])
+        app.at("17:20")
+        app.set_soc(56)
+        app.reconcile()
+        self.assertEqual(app.ops, [])
+        status, attrs = app.status()[1], app.status()[2]
+        self.assertEqual(status, "not_controlling")
+        self.assertFalse(attrs["inverter_control"])
+        self.assertIn("secret", attrs["warning"])
+        self.assertEqual(app.overview()[1], "not_controlling")
+        self.assertIn("isn't being controlled", app.overview()[2]["warning"])
+
+    def test_with_credentials_no_warning(self):
+        app = armed_app()
+        app.at("16:45")
+        app.set_soc(56.25)
+        app.reconcile()
+        self.assertTrue(app.status()[2]["inverter_control"])
+        self.assertIsNone(app.overview()[2]["warning"])
+
+
 class SolisCloudTests(unittest.TestCase):
     """The real solis_apply against the fake SolisCloud."""
 

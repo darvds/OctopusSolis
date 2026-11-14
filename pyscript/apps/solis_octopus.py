@@ -51,7 +51,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 log = logging.getLogger("pyscript.solis_octopus")
 log.setLevel(logging.DEBUG)
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 
 # -----------------------------
 # SolisCloud endpoints / constants
@@ -294,6 +294,13 @@ if RENAULT_ENABLED and not HH_ENABLED:
 
 _missing_credentials = [k for k in ("key_id", "secret", "username", "password", "plantId") if not CFG.get(k)]
 INVERTER_CONTROL = not _missing_credentials
+
+
+def credentials_warning():
+    return (f"SolisCloud credentials missing ({', '.join(_missing_credentials)}): "
+            "the inverter isn't being controlled, the plan is shown only.")
+
+
 if _missing_credentials:
     log.error("SolisCloud credentials missing (%s); the inverter won't be controlled",
               ", ".join(_missing_credentials))
@@ -2305,7 +2312,9 @@ def _slot_attrs(key):
 
 
 def publish_overview(now, export_window, hh_window):
-    if stand_aside(export_window, now):
+    if not INVERTER_CONTROL:
+        state_value = "not_controlling"
+    elif stand_aside(export_window, now):
         state_value = "axle_event"
     elif export_started(export_window, now):
         state_value = "exporting"
@@ -2324,6 +2333,8 @@ def publish_overview(now, export_window, hh_window):
                      "peak_export": PEAK_EXPORT, "axle": AXLE_EVENTS,
                      "renault": RENAULT_ENABLED},
         "slot_problems": SLOT_PROBLEMS or None,
+        "inverter_control": INVERTER_CONTROL,
+        "warning": None if INVERTER_CONTROL else credentials_warning(),
         "last_reason": _flags["last_reason"],
         "last_write_ok": _flags["last_write_ok"],
         "diagnostics_only": DIAGNOSTICS_ONLY,
@@ -2424,6 +2435,8 @@ def publish_export_status(session, plan, now, events_status="ok", axle_status="d
     active = running and session["kind"] == "power_down"
     if session is None:
         status = "idle"
+    elif not INVERTER_CONTROL:
+        status = "not_controlling"
     elif is_axle(session) and not axle_dispatch(session):
         status = "axle_event" if running else "axle_upcoming"
     elif _last["decision"] and "export paused" in _last["decision"]:
@@ -2454,6 +2467,7 @@ def publish_export_status(session, plan, now, events_status="ok", axle_status="d
         "power_down_events": events_status,
         "axle_events": axle_status,
         "diagnostics_only": DIAGNOSTICS_ONLY,
+        "inverter_control": INVERTER_CONTROL,
         "version": VERSION,
         "last_updated": datetime.now(timezone.utc).isoformat(),
         "friendly_name": "Solis Power Down",
@@ -2466,6 +2480,8 @@ def publish_export_status(session, plan, now, events_status="ok", axle_status="d
         attrs["axle_event_end"] = to_local(session["event_end"]).isoformat()
         attrs["axle_control"] = AXLE_CONTROL
     warnings = []
+    if not INVERTER_CONTROL:
+        warnings.append(credentials_warning())
     for w in (pd_events_warning(events_status) if PD_ENABLED else None, axle_warning(axle_status)):
         if w:
             warnings.append(w)
