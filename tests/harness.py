@@ -78,6 +78,7 @@ LEGACY_KEYS = {
     "export_limit_kw": ("battery", "export_limit_kw"),
     "discharge_efficiency": ("battery", "discharge_efficiency"),
     "min_export_kw": ("battery", "min_export_kw"),
+    "stop_soc_margin": ("battery", "stop_soc_margin"),
     "current_step_amps": ("battery", "current_step_amps"),
     "prepare_minutes": ("battery", "prepare_minutes"),
     "discharge_slot": ("slots", "export"),

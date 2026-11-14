@@ -55,6 +55,8 @@ So the grid only covers house load above roughly the full discharge rate. The pl
 
 The slot is written `prepare_minutes` before the window, starting at the full-rate part. Every minute it's re-planned from the real SOC. Before the full-rate part begins, its start moves if the house uses more or less than predicted. It isn't moved later while the slot can still run at `export_keep_start_rate` of full rate from the start already written, so the inverter isn't rewritten for every 1% of SOC. Once the full-rate part is running, its start stays put and only the current is adjusted, so the battery ends at the reserve.
 
+The slot's stop SOC is `stop_soc_margin` (3%) below that finish, never below `floor_soc`. When a Solis timed discharge reaches its stop SOC before the slot ends, the battery idles and the grid covers the house for the rest of the slot. So the app ends the export itself when the battery reaches the planned finish, switching back to self-use, and the inverter's stop SOC is only a fail-safe.
+
 **Axle Energy.** See [Axle Energy](#axle-energy) below.
 
 **Fail-safe.** Every slot has a fixed time window and stop SOC, so the inverter starts and stops by itself. If Home Assistant, pyscript or SolisCloud goes down, nothing runs past its window.
@@ -186,6 +188,7 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 | `discharge_efficiency` | `0.95` | Battery-to-AC efficiency |
 | `min_export_kw` | `0.2` | Only export when it exports at least this rate |
 | `export_start_step_minutes` | `5` | The full-rate export starts on a multiple of this many minutes |
+| `stop_soc_margin` | `3` | The slot's stop SOC sits this many % below where the export plans to finish (never below `floor_soc`), so the app ends the export, not the inverter |
 | `export_keep_start_rate` | `0.8` | Keep an already-written start while the slot can still run at this share of full rate from it |
 | `current_step_amps` | `5` | Minimum change before the current is rewritten |
 | `prepare_minutes` | `15` | Write the discharge slot this long before a window |

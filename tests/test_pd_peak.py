@@ -81,7 +81,7 @@ class PeakPredictionTests(unittest.TestCase):
         # Self-use to 17:50, then (nearly) full rate to the end of the peak.
         self.assertEqual(p["export_window"], "17:50-19:00")
         self.assertEqual(p["discharge_current"], 98)
-        self.assertEqual(p["stop_soc"], 33)
+        self.assertEqual(p["stop_soc"], 29)
         self.assertEqual(p["predicted_export_kwh"], 5.12)
         self.assertEqual(p["estimated_export_value_pence"], 82.0)
         self.assertEqual(p["estimated_octopoints"], 0)
@@ -162,7 +162,7 @@ class MinExportTests(unittest.TestCase):
         self.app.at("17:30")
         self.app.set_soc(80)
         self.app.reconcile()
-        self.assertEqual(self.app.ops, [retarget("18:35-19:00", 95, 51)])
+        self.assertEqual(self.app.ops, [retarget("18:35-19:00", 95, 47)])
 
     def test_threshold_configurable(self):
         app = peak_app({"default_load_kw": 0.9, "min_export_kw": 5})
@@ -187,7 +187,7 @@ class PeakScenarioTests(unittest.TestCase):
         app = peak_app()
         self.run_steps(app, [
             ("15:30", 100, [], "planned"),
-            ("15:45", 100, [arm("17:50-19:00", 98, 33)], "armed"),
+            ("15:45", 100, [arm("17:50-19:00", 98, 29)], "armed"),
             # Self-use: the battery covers the house, the slot waits.
             ("16:30", 96, [], "armed"),
             ("17:30", 91, [], "armed"),
@@ -201,11 +201,11 @@ class PeakScenarioTests(unittest.TestCase):
     def test_power_down_inside_peak(self):
         app = peak_app(joined=[event("17:00", "18:00")])
         self.run_steps(app, [
-            ("15:45", 100, [arm("16:50-17:00", 85, 88)], "armed"),
+            ("15:45", 100, [arm("16:50-17:00", 85, 84)], "armed"),
             ("16:30", 96, [], "armed"),
             ("16:50", 94, [[("value", CURRENT_CID, "78")]], "exporting"),
-            ("17:00", 88, [retarget("17:00-18:00", 100, 38)], "exporting"),
-            ("18:00", 43, [retarget("18:50-19:00", 76, 33)], "armed"),
+            ("17:00", 88, [retarget("17:00-18:00", 100, 34)], "exporting"),
+            ("18:00", 43, [retarget("18:50-19:00", 76, 29)], "armed"),
             ("19:00", 33, [CLEAR], "no_spare_energy"),
         ])
 

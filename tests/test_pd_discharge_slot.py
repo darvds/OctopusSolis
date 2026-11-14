@@ -4,7 +4,7 @@ from tests.harness import (App, CURRENT_CID, SOC_CID, SWITCH_CID, TIME_CID, even
 
 # Self-use to 17:40, then 85 A (4.25 kW) to the end of the session.
 ARM = [("value", TIME_CID, "17:40-18:00"), ("value", CURRENT_CID, "85"),
-       ("value", SOC_CID, "38"), ("switch", SWITCH_CID, True)]
+       ("value", SOC_CID, "34"), ("switch", SWITCH_CID, True)]
 CLEAR = [("switch", SWITCH_CID, False), ("value", TIME_CID, "00:00-00:00")]
 
 
@@ -53,6 +53,25 @@ class SessionScenarioTests(unittest.TestCase):
         app.at("17:10")
         app.reconcile()
         self.assertEqual(app.active(), "on")
+
+    def test_app_ends_export_before_the_inverter_stop_soc(self):
+        # Battery ran hot and reached the planned finish (37.5%) at 17:55.
+        # The app switches back to self-use itself; the inverter's stop SOC
+        # (34%) is never reached, so it never idles the battery while the
+        # house draws from the grid.
+        app = armed_app()
+        app.g["_slots"]["export"]["unknown"] = False
+        app.at("16:45")
+        app.set_soc(56.25)
+        app.reconcile()
+        app.at("17:45")
+        app.set_soc(48)
+        app.reconcile()
+        app.ops.clear()
+        app.at("17:55")
+        app.set_soc(37.5)
+        app.reconcile()
+        self.assertEqual(app.ops, [CLEAR])
 
     def test_programmed_start_not_rewritten_every_minute(self):
         app = armed_app()
@@ -112,7 +131,7 @@ class SessionScenarioTests(unittest.TestCase):
         app.set_soc(44.6)
         app.reconcile("startup")
         self.assertEqual(app.ops, [[("value", TIME_CID, "17:00-18:00"), ("value", CURRENT_CID, "86"),
-                                    ("value", SOC_CID, "38"), ("switch", SWITCH_CID, True)]])
+                                    ("value", SOC_CID, "34"), ("switch", SWITCH_CID, True)]])
 
     def test_no_spare_energy_leaves_slot_off(self):
         app = armed_app()
@@ -180,7 +199,7 @@ class SolisCloudTests(unittest.TestCase):
         self.assertEqual(app.cloud.control_writes(), [
             (TIME_CID, "17:40-18:00", None),
             (CURRENT_CID, "85", None),
-            (SOC_CID, "38", None),
+            (SOC_CID, "34", None),
             (SWITCH_CID, "1", "1"),
         ])
 

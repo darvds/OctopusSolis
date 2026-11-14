@@ -26,12 +26,32 @@ class PredictionTests(unittest.TestCase):
         self.assertEqual(p["discharge_kw"], 4.25)
         self.assertEqual(p["discharge_current"], 85)
         self.assertEqual(p["battery_used_kwh"], 1.75)
-        self.assertEqual(p["stop_soc"], 38)
+        self.assertEqual(p["stop_soc"], 34)
         self.assertEqual(p["predicted_house_load_kwh"], 0.5)
         self.assertEqual(p["predicted_export_kwh"], 1.25)
         self.assertEqual(p["predicted_import_kwh"], 0)
         self.assertEqual(p["estimated_octopoints"], 400)
         self.assertEqual(p["window"], "17:00-18:00")
+
+    def test_stop_soc_sits_below_the_planned_finish(self):
+        app = App()
+        p = plan(app, session("17:00", "18:00"), local("12:00"))
+        # Plans to finish at the 3.75 kWh reserve; the inverter stops at 34%.
+        self.assertEqual(p["target_kwh"], 3.75)
+        self.assertEqual(p["stop_soc"], 34)
+
+    def test_stop_soc_margin_never_goes_below_floor(self):
+        app = App()
+        p = app.predict(session("17:00", "18:00"), local("16:50"), 80, None, {}, {}, drain_to_floor=True)
+        # Floor 10%: the inverter stops at the floor, the plan finishes at 13%.
+        self.assertEqual(p["stop_soc"], 10)
+        self.assertEqual(p["target_kwh"], 1.3)
+
+    def test_stop_soc_margin_configurable(self):
+        app = App({"stop_soc_margin": 0})
+        p = plan(app, session("17:00", "18:00"), local("12:00"))
+        self.assertEqual(p["stop_soc"], 37)
+        self.assertEqual(p["target_kwh"], 3.75)
 
     def test_reserve_margin_scales_evening_load(self):
         app = App({"reserve_margin": 1.2})

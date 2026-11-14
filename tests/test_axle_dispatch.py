@@ -84,7 +84,7 @@ class ExportTests(unittest.TestCase):
         d, k = drain.status()[2], keep.status()[2]
         # Keeping 18:30-23:30 at 0.5 kW on top of the floor.
         self.assertEqual(k["reserve_kwh"], 3.5)
-        self.assertEqual(k["stop_soc"], 35)
+        self.assertEqual(k["stop_soc"], 32)
         # Self-use for 5 minutes, then 95 A to the end of the event.
         self.assertEqual(k["export_window"], "17:35-18:30")
         self.assertEqual(k["discharge_current"], 95)

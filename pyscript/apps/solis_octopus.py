@@ -51,7 +51,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 log = logging.getLogger("pyscript.solis_octopus")
 log.setLevel(logging.DEBUG)
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 # -----------------------------
 # SolisCloud endpoints / constants
@@ -212,6 +212,11 @@ EXPORT_PREPARE_MINUTES = int(BAT.get("prepare_minutes", 15))
 # still run at this share of full rate from it.
 EXPORT_START_STEP_MINUTES = max(1, int(BAT.get("export_start_step_minutes", 5)))
 EXPORT_KEEP_START_RATE = float(BAT.get("export_keep_start_rate", 0.8))
+# The slot's stop SOC sits this many % below where the plan finishes. When a
+# Solis timed discharge reaches its stop SOC early, the battery idles for the
+# rest of the slot and the grid covers the house. With the margin, the app
+# ends the export (back to self-use) before the inverter's stop is reached.
+STOP_SOC_MARGIN = max(0, int(BAT.get("stop_soc_margin", 3)))
 
 # --- EV-Follow ---
 EV_ENABLED = _cfg_bool("enabled", bool(EVC), EVC)
@@ -1275,6 +1280,13 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_t
             kw, hrs = max_battery_kw(max(w["start"], end), w["end"])
             held_kwh += max(0.0, kw * hrs - net_drain(max(w["start"], end), w["end"]))
     reserve_kwh = min(cap, floor_kwh + RESERVE_MARGIN * evening_kwh + held_kwh)
+    # The inverter's stop SOC: STOP_SOC_MARGIN below the reserve, never below
+    # the floor. The plan finishes at least that margin above it.
+    stop_soc = 100
+    if cap > 0:
+        stop_soc = int(math.floor(reserve_kwh / cap * 100.0 + 1e-6)) - STOP_SOC_MARGIN
+    stop_soc = max(FLOOR_SOC, min(100, stop_soc))
+    target_kwh = min(cap, max(reserve_kwh, (stop_soc + STOP_SOC_MARGIN) / 100.0 * cap))
 
     session_periods = periods(start, end)
     hours = 0.0
@@ -1285,7 +1297,7 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_t
         load_kwh += load_kw(t) * h
         solar_kwh += solar_kw(t) * h
 
-    spare_kwh = max(0.0, battery_at_start - reserve_kwh)
+    spare_kwh = max(0.0, battery_at_start - target_kwh)
     full_kw = 0.0
     if hours > 0:
         # Battery power that would push exactly the export limit out.
@@ -1367,8 +1379,6 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_t
             value_pence += exported * rate
     battery_used_kwh = power_kw * forced_hours + max(0.0, min(spare_kwh, self_use_kwh))
 
-    stop_soc = int(math.ceil(reserve_kwh / cap * 100.0 - 1e-6)) if cap > 0 else 100
-    stop_soc = max(FLOOR_SOC, min(100, stop_soc))
     avoided_kwh = max(0.0, load_kwh - import_kwh)
 
     return {
@@ -1380,6 +1390,7 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_t
         "hours": round(hours, 3),
         "battery_at_start_kwh": round(battery_at_start, 2),
         "reserve_kwh": round(reserve_kwh, 2),
+        "target_kwh": round(target_kwh, 2),
         "held_for_power_down_kwh": round(held_kwh, 2),
         "evening_load_kwh": round(evening_kwh, 2),
         "spare_kwh": round(spare_kwh, 2),
