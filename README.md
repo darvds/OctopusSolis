@@ -1,6 +1,8 @@
 # Solis Octopus
 
-One [pyscript](https://github.com/custom-components/pyscript) app for Home Assistant that runs a **Solis** home battery for everything **Octopus** (and **Axle Energy**) related. It replaces three separate apps, which each drove the inverter on their own:
+One [pyscript](https://github.com/custom-components/pyscript) app for Home Assistant that runs a **Solis** home battery for everything **Octopus** (and **Axle Energy**) related. It controls the inverter **locally**, through the [Solis Modbus](https://github.com/Pho3niX90/solis_modbus) integration's entities. Nothing goes through SolisCloud.
+
+It replaces three separate apps, which each drove the inverter on their own:
 
 - [Solis EV-Follow](https://github.com/darvds/SolisOctopusEVFollow): charge the battery while the car is really being smart-charged.
 - [Octopus Happy Hour](https://github.com/darvds/OctopusHappyHour): charge during Happy Hours / Power Ups, boost the Cosy hot water, run your actions.
@@ -16,9 +18,7 @@ Separately, the three apps could get in each other's way:
 - **Charging and exporting at once.** A happy hour or EV dispatch during the peak window left the inverter with a charge slot and a discharge slot at the same time.
 - **Axle ignored.** Only Power Down stayed off the inverter during Axle events.
 - **Lost switch changes.** Each app read the 12 slot on/off states and then wrote its own. Two apps doing that at once could undo each other's change.
-- **Three logins.** Each app logged in to SolisCloud and synced the clock separately.
-
-Now one app decides what every slot should hold, in one pass, with one priority order. It sends the changes to the inverter in one batch, through one login, with a lock around every write.
+Now one app decides what every slot should hold, in one pass, with one priority order. It sends the changes to the inverter in one batch, with a lock around every write.
 
 ## Priority
 
@@ -47,11 +47,19 @@ Before an Axle export event or a Power Down session, earlier export windows **ho
 - the battery at the start
 - the reserve the house needs until the cheap window
 
-Everything above the reserve is exported, capped by your inverter, battery current and export limit. The slot is written `prepare_minutes` before the window. During the window it's re-planned every minute from the real SOC.
+Everything above the reserve is exported, capped by your inverter, battery current and export limit. The export isn't spread thinly over the window. While a Solis timed discharge slot runs, the battery holds the slot's current, and the grid covers any house load above it. A slow, spread-out discharge would import every time the kettle or oven went on. Instead:
+- the inverter stays in **self-use** for the first part of the window, so the battery covers the house as usual
+- it discharges at **full rate** for the last part (up to your export limit plus the house), timed so the battery reaches the reserve as the window ends
+
+So the grid only covers house load above roughly the full discharge rate. The planned full-rate part shows as `export_window` (the session itself is `window`).
+
+The slot is written `prepare_minutes` before the window, starting at the full-rate part. Every minute it's re-planned from the real SOC. Before the full-rate part begins, its start moves if the house uses more or less than predicted. It isn't moved later while the slot can still run at `export_keep_start_rate` of full rate from the start already written, so the inverter isn't rewritten for every 1% of SOC. Once the full-rate part is running, its start stays put and only the current is adjusted, so the battery ends at the reserve.
+
+The slot's stop SOC is `stop_soc_margin` (3%) below that finish, never below `floor_soc`. When a Solis timed discharge reaches its stop SOC before the slot ends, the battery idles and the grid covers the house for the rest of the slot. So the app ends the export itself when the battery reaches the planned finish, switching back to self-use, and the inverter's stop SOC is only a fail-safe.
 
 **Axle Energy.** See [Axle Energy](#axle-energy) below.
 
-**Fail-safe.** Every slot has a fixed time window and stop SOC, so the inverter starts and stops by itself. If Home Assistant, pyscript or SolisCloud goes down, nothing runs past its window.
+**Fail-safe.** Every slot has a fixed time window and stop SOC, so the inverter starts and stops by itself. If Home Assistant, pyscript or the Modbus link goes down, nothing runs past its window.
 
 ## Axle Energy
 
@@ -65,7 +73,7 @@ The app reads the [Axle Energy integration](https://www.home-assistant.io/integr
 In both modes Axle pays the same way: it credits *"whatever you export to the grid during the scheduled event window"*. Standard events are announced the day before, and short-notice events, which you opt into, come 2 hours ahead. Event times never change once an event has started.
 
 **With `control: true` (Self-Dispatch)**
-- **Export events** are planned like any other export window and written `prepare_minutes` before the event. The battery exports everything above the **floor** (`battery.floor_soc`), spread over the event and capped by your inverter, battery current and export limit.
+- **Export events** are planned like any other export window and written `prepare_minutes` before the event. The battery exports everything above the **floor** (`battery.floor_soc`), at full rate towards the end of the event (self-use before that), capped by your inverter, battery current and export limit.
   - The usual evening reserve isn't kept, because Axle's payment per kWh normally beats what the evening costs. Set `keep_evening_reserve: true` to keep it.
   - Battery is still held back for a later Power Down session before the cheap window.
 - **Before an event**, earlier peak and Power Down windows hold back what the event can export.
@@ -98,13 +106,40 @@ Your charger has to let the car charge during the happy hour too. If Octopus con
 
 The car's current schedule shows in the `car_schedule` attribute of `sensor.octopus_happy_hour`.
 
+## Solis Modbus
+
+The app drives the inverter only through the [Solis Modbus](https://github.com/Pho3niX90/solis_modbus) integration's *Grid Time of Use* entities. For slot `N`, with the prefix `solis`:
+
+| | Charge slot | Discharge slot |
+|---|---|---|
+| Window | `time.solis_grid_time_of_use_charge_start_slot_N` / `..._charge_end_slot_N` | `time.solis_grid_time_of_use_discharge_start_slot_N` / `..._discharge_end_slot_N` |
+| Current (A) | `number.solis_grid_time_of_use_charge_battery_current_slot_N` | `number.solis_grid_time_of_use_discharge_battery_current_slot_N` |
+| Stop SOC (%) | `number.solis_grid_time_of_use_charge_cut_off_soc_slot_N` | `number.solis_grid_time_of_use_discharge_cut_off_soc_slot_N` |
+| On/off | `switch.solis_grid_time_of_use_charging_period_N` | `switch.solis_grid_time_of_use_discharge_period_N` |
+
+- Writes use the standard `time.set_value`, `number.set_value` and `switch.turn_on` / `turn_off` actions, one at a time, under one lock.
+- A slot is switched off before it's cleared, and only switched on once its window, current and SOC are written. A failed write stops the batch, so a half-written slot is never switched on. It's retried at the next check.
+- Switches already in the right state aren't written again. Solis Modbus keeps the other slots' on/off bits as they are.
+- Entities created by older Solis Modbus versions keep their old IDs (e.g. `switch.solis_solis_grid_time_of_use_charging_period_1`). When the exact ID isn't there, the app uses the one entity whose ID ends the same way, and logs which one.
+- The prefix comes from the inverter's device name in Solis Modbus. It's found automatically from `time.*_grid_time_of_use_charge_start_slot_1`. With more than one inverter, set `inverter_prefix`.
+- At startup the log says whether every slot entity the app needs was found. The prefix in use shows in the `inverter_prefix` attribute of `sensor.solis_octopus`.
+
+### Moving over from the SolisCloud version
+
+1. Install and set up Solis Modbus, and check the *Grid Time of Use* entities above show your current slots.
+2. Remove `key_id`, `secret`, `username`, `password`, `plantId`, `inverter_sn` / `inverter_id` and `sync_inverter_time` from the `solis_octopus:` block. They're ignored now. Solis Modbus syncs the inverter clock itself.
+3. Restart with `diagnostics_only: true` and check the log, as below.
+4. Optionally, revoke the SolisCloud API key, so nothing else can change the inverter from the cloud.
+
 ## Requirements
 
 - Home Assistant with [pyscript](https://github.com/custom-components/pyscript) (HACS).
 - A Solis hybrid inverter:
-  - **6-slot firmware** (HMI ≥ `4B00`)
+  - **6-slot "Grid Time of Use" firmware** (HMI ≥ `4B00`)
   - **time-of-use / timed charge-discharge enabled**
-  - SolisCloud API access
+- The [Solis Modbus](https://github.com/Pho3niX90/solis_modbus) integration (HACS), connected to the inverter (e.g. over a Modbus TCP data logger or an RS485 adapter):
+  - **not** in essential-only / read-only mode, so the slot entities exist and can be written.
+  - Its clock sync on (the default), so the inverter's clock matches Home Assistant's.
 - The [Octopus Energy integration](https://github.com/BottlecapDave/HomeAssistant-OctopusEnergy):
   - **EV-Follow:** the intelligent dispatching sensor set to "started dispatches only".
   - **Happy Hour:** the power up events entity **enabled**. It's disabled by default.
@@ -139,16 +174,15 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 
 | Option | Default | Description |
 |---|---|---|
-| `key_id`, `secret`, `username`, `password`, `plantId` | **required** | SolisCloud API credentials. Without them the inverter isn't controlled. |
-| `inverter_sn` / `inverter_id` | auto | Only needed with more than one storage inverter |
+| `inverter_prefix` | auto | Solis Modbus entity ID prefix: `solis` for `time.solis_grid_time_of_use_charge_start_slot_1`. Only needed with more than one inverter. |
+| `inverter_control` | `true` | `false` to never write the inverter (happy hour boosts, actions and the car schedule still run) |
 | `inverter_timezone` | HA time zone | Time zone of the inverter clock and slots |
 | `core_window` | `23:30-05:30` | Octopus cheap overnight window |
 | `notify_service` | none | e.g. `notify.mobile_app_phone`, or a list |
 | `notify_data` | none | Extra `data` for notifications |
 | `diagnostics_only` | `false` | Log instead of writing, boosting or running actions |
-| `sync_inverter_time` | `true` | Sync the inverter clock at most once a day |
 | `startup_delay_seconds` | `60` | Wait for other integrations after startup |
-| `control_retries`, `verify_readback` | `3`, `false` | SolisCloud write behaviour |
+| `control_retries`, `verify_readback` | `3`, `false` | Retries per entity write, and whether to check the entity's state after writing |
 
 **`slots:`**
 
@@ -179,6 +213,9 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 | `export_limit_kw` | `3.68` | Your export limit |
 | `discharge_efficiency` | `0.95` | Battery-to-AC efficiency |
 | `min_export_kw` | `0.2` | Only export when it exports at least this rate |
+| `export_start_step_minutes` | `5` | The full-rate export starts on a multiple of this many minutes |
+| `stop_soc_margin` | `3` | The slot's stop SOC sits this many % below where the export plans to finish (never below `floor_soc`), so the app ends the export, not the inverter |
+| `export_keep_start_rate` | `0.8` | Keep an already-written start while the slot can still run at this share of full rate from it |
 | `current_step_amps` | `5` | Minimum change before the current is rewritten |
 | `prepare_minutes` | `15` | Write the discharge slot this long before a window |
 
@@ -279,7 +316,8 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 
 - **A feature isn't doing anything.** Check the `features` attribute on `sensor.solis_octopus`. Then check the `*_events` health attributes on its own sensor. A typo in an entity ID shows as `missing`, with a `warning`.
 - **"Not starting: fix the slots config first".** Two features are set to the same charge slot. The details are in `slot_problems` on `sensor.solis_octopus`.
-- **Slots at the wrong times.** Check the inverter clock and `inverter_timezone`.
+- **Slots at the wrong times.** Check the inverter clock (Solis Modbus's clock sync) and `inverter_timezone`.
+- **"Solis Modbus entities missing or unavailable".** The log names them. Check the Solis Modbus integration is connected, isn't in read-only mode, and shows the *Grid Time of Use* entities for your inverter. If your entity IDs start with something other than the detected prefix, set `inverter_prefix`.
 - **Axle's settings get overwritten (Events Only).** Make sure Axle doesn't use the same Solis slots as this app, and change `slots:` if it does. Or switch Axle to Self-Dispatch and set `axle: control: true`.
 - **Before sharing logs**, remove inverter serial numbers and your Octopus account ID.
 
@@ -291,17 +329,16 @@ The tests use only the Python standard library (3.9+), plus PyYAML for the examp
 python3 -m unittest discover -s tests -t .
 ```
 
-`tests/harness.py` loads the app with fakes for pyscript's globals, the clock, HA states and services, recorder history and SolisCloud. The test suites come from the three original apps (EV-Follow, Happy Hour, Power Down), run against the combined app. On top of those, `tests/test_arbiter.py` runs every feature at once and covers:
+`tests/harness.py` loads the app with fakes for pyscript's globals, the clock, HA states and services, recorder history and the Solis Modbus entities. The test suites come from the three original apps (EV-Follow, Happy Hour, Power Down), run against the combined app. On top of those, `tests/test_arbiter.py` runs every feature at once and covers:
 - each clash listed under [Why one app](#why-one-app)
-- one login and one switch read per pass
+- one batch of writes per pass
 - the write lock
 
 CI runs the suite on every push.
 
 ## Credits
 
-- [Moondevil-ha/solis-smart-charging](https://github.com/Moondevil-ha/solis-smart-charging) and [stevegal/solis_control](https://github.com/stevegal/solis_control) (MIT): SolisCloud API signing, login and control writes.
-- [hultenvp/solis-sensor](https://github.com/hultenvp/solis-sensor) and [mkuthan/solis-cloud-control](https://github.com/mkuthan/solis-cloud-control): slot CIDs and the `yuanzhi` bitmask.
+- [Pho3niX90/solis_modbus](https://github.com/Pho3niX90/solis_modbus): local Modbus control of Solis inverters, and the entities this app writes.
 - [BottlecapDave/HomeAssistant-OctopusEnergy](https://github.com/BottlecapDave/HomeAssistant-OctopusEnergy): Octoplus, dispatch and Cosy entities and actions.
 - The Axle Energy integration in Home Assistant core.
 

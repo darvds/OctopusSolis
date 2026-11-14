@@ -6,15 +6,14 @@ app with as few edits as possible: its flat config keys go to the
 from datetime import datetime, timezone
 
 from tests import harness
-from tests.harness import CHARGE_CURRENT_CIDS, CHARGE_SOC_CIDS, CHARGE_SWITCH_CIDS, CHARGE_TIME_CIDS, TZ
+from tests.harness import TZ, charge_slot
 
 EVENTS = harness.HH_EVENTS
 TOKENS = harness.HH_TOKENS
 WATER_HEATER = "water_heater.octopus_energy_heat_pump_hp1"
 
 # Charge slot 3 (the default).
-TIME_CID, CURRENT_CID, SOC_CID, SWITCH_CID = (CHARGE_TIME_CIDS[2], CHARGE_CURRENT_CIDS[2],
-                                              CHARGE_SOC_CIDS[2], CHARGE_SWITCH_CIDS[2])
+TIME, CURRENT, CUTOFF_SOC, SWITCH = charge_slot(3)
 
 HH_KEYS = {
     "power_up_events_entity", "weekend_happy_hours_entity", "auto_join", "join_selection",

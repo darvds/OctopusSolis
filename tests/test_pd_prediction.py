@@ -19,14 +19,39 @@ class PredictionTests(unittest.TestCase):
         # 1 kWh floor + 18:00-23:30 at 0.5 kW
         self.assertEqual(p["evening_load_kwh"], 2.75)
         self.assertEqual(p["reserve_kwh"], 3.75)
-        self.assertEqual(p["discharge_kw"], 1.75)
-        self.assertEqual(p["discharge_current"], 35)
-        self.assertEqual(p["stop_soc"], 38)
+        # Self-use until 17:40 (the battery covers the house), then full rate:
+        # 1.75 kWh spare - 0.33 kWh of house = 1.42 kWh in 20 minutes.
+        self.assertEqual(p["export_window"], "17:40-18:00")
+        self.assertEqual(p["export_start"], local("17:40").isoformat())
+        self.assertEqual(p["discharge_kw"], 4.25)
+        self.assertEqual(p["discharge_current"], 85)
+        self.assertEqual(p["battery_used_kwh"], 1.75)
+        self.assertEqual(p["stop_soc"], 34)
         self.assertEqual(p["predicted_house_load_kwh"], 0.5)
         self.assertEqual(p["predicted_export_kwh"], 1.25)
         self.assertEqual(p["predicted_import_kwh"], 0)
         self.assertEqual(p["estimated_octopoints"], 400)
         self.assertEqual(p["window"], "17:00-18:00")
+
+    def test_stop_soc_sits_below_the_planned_finish(self):
+        app = App()
+        p = plan(app, session("17:00", "18:00"), local("12:00"))
+        # Plans to finish at the 3.75 kWh reserve; the inverter stops at 34%.
+        self.assertEqual(p["target_kwh"], 3.75)
+        self.assertEqual(p["stop_soc"], 34)
+
+    def test_stop_soc_margin_never_goes_below_floor(self):
+        app = App()
+        p = app.predict(session("17:00", "18:00"), local("16:50"), 80, None, {}, {}, drain_to_floor=True)
+        # Floor 10%: the inverter stops at the floor, the plan finishes at 13%.
+        self.assertEqual(p["stop_soc"], 10)
+        self.assertEqual(p["target_kwh"], 1.3)
+
+    def test_stop_soc_margin_configurable(self):
+        app = App({"stop_soc_margin": 0})
+        p = plan(app, session("17:00", "18:00"), local("12:00"))
+        self.assertEqual(p["stop_soc"], 37)
+        self.assertEqual(p["target_kwh"], 3.75)
 
     def test_reserve_margin_scales_evening_load(self):
         app = App({"reserve_margin": 1.2})
@@ -36,6 +61,8 @@ class PredictionTests(unittest.TestCase):
     def test_capped_by_export_limit(self):
         app = App({"export_limit_kw": 1.0})
         p = plan(app, session("17:00", "18:00"), local("12:00"))
+        # Full rate (1 kW out + 0.5 kW house) for the whole hour still fits the spare.
+        self.assertEqual(p["export_window"], "17:00-18:00")
         self.assertEqual(p["discharge_kw"], 1.5)
         self.assertEqual(p["discharge_current"], 30)
         self.assertEqual(p["predicted_export_kwh"], 1.0)
@@ -55,7 +82,10 @@ class PredictionTests(unittest.TestCase):
     def test_voltage_sensor_used_for_current(self):
         app = App()
         p = plan(app, session("17:00", "18:00"), local("12:00"), voltage=35.0)
-        self.assertEqual(p["discharge_current"], 50)
+        # 100 A at 35 V is 3.5 kW, so full rate starts earlier.
+        self.assertEqual(p["discharge_current"], 100)
+        self.assertEqual(p["discharge_kw"], 3.5)
+        self.assertEqual(p["export_window"], "17:35-18:00")
 
     def test_nothing_to_spare(self):
         app = App()
@@ -71,7 +101,9 @@ class PredictionTests(unittest.TestCase):
         p = plan(app, sess, local("22:00", day=5), soc=30)
         # Full at 05:30, then 11.5 h x 0.5 kW
         self.assertEqual(p["battery_at_start_kwh"], 4.25)
-        self.assertEqual(p["discharge_current"], 10)
+        # 0.5 kWh spare is just the house's 0.5 kWh: self-use, no forced slot.
+        self.assertEqual(p["discharge_current"], 0)
+        self.assertIsNone(p["export_window"])
 
     def test_load_profile_from_history(self):
         app = App()
@@ -97,11 +129,67 @@ class PredictionTests(unittest.TestCase):
 
     def test_replan_mid_session_uses_remaining_time(self):
         app = App()
-        p = plan(app, session("17:00", "18:00"), local("17:30"), soc=40)
+        p = plan(app, session("17:00", "18:00"), local("17:30"), soc=50)
         self.assertEqual(p["hours"], 0.5)
-        self.assertEqual(p["battery_at_start_kwh"], 4.0)
-        self.assertEqual(p["discharge_kw"], 0.5)
-        self.assertEqual(p["discharge_current"], 10)
+        self.assertEqual(p["battery_at_start_kwh"], 5.0)
+        # 1.25 kWh spare: 0.125 kWh of house to 17:45, then 1.125 kWh in 15 minutes.
+        self.assertEqual(p["export_window"], "17:45-18:00")
+        self.assertEqual(p["discharge_kw"], 4.5)
+        self.assertEqual(p["discharge_current"], 90)
+
+    def test_spare_only_covers_the_house_forces_nothing(self):
+        # The old plan forced 10 A here: exactly the house load, so any spike
+        # above it came from the grid. Self-use covers the house anyway.
+        app = App()
+        p = plan(app, session("17:00", "18:00"), local("17:30"), soc=40)
+        self.assertEqual(p["spare_kwh"], 0.25)
+        self.assertEqual(p["discharge_current"], 0)
+        self.assertEqual(p["predicted_import_kwh"], 0)
+
+    def test_full_rate_whatever_the_house_load_profile(self):
+        # Your evening: the hourly mean hides the oven and the kettle. The
+        # slot runs at full rate, so the grid only covers loads above ~4.4 kW.
+        app = App({"export_limit_kw": 3.68, "discharge_efficiency": 0.95, "reserve_margin": 1.2})
+        profile = {h: 0.5 for h in range(24)}
+        profile.update({16: 0.8, 17: 1.2, 18: 0.9})
+        p = plan(app, session("16:00", "19:00"), local("15:50"), soc=75, profile=profile)
+        self.assertEqual(p["export_window"], "18:45-19:00")
+        self.assertEqual(p["discharge_current"], 84)
+        self.assertGreater(p["discharge_kw"], 4.0)
+        self.assertEqual(p["battery_used_kwh"], p["spare_kwh"])
+
+    def test_programmed_start_kept_when_plan_moves_a_little_later(self):
+        app = App()
+        sess = session("16:00", "19:00")
+        # On its own the plan would start at 18:05 at 99 A. The slot keeps
+        # 17:55 at 85 A (over 80% of full rate), still ending at the reserve.
+        self.assertEqual(plan(app, sess, local("16:00"), soc=88)["export_window"], "18:05-19:00")
+        p = app.predict(sess, local("16:00"), 88, None, {}, {}, programmed_start=local("17:55"))
+        self.assertEqual(p["export_window"], "17:55-19:00")
+        self.assertEqual(p["discharge_current"], 85)
+        self.assertEqual(p["battery_used_kwh"], p["spare_kwh"])
+
+    def test_programmed_start_moved_later_rather_than_run_slow(self):
+        app = App()
+        sess = session("17:00", "18:00")
+        # Keeping 17:35 would mean 54 A: too slow, so the start moves to 17:45.
+        p = app.predict(sess, local("17:20"), 50, None, {}, {}, programmed_start=local("17:35"))
+        self.assertEqual(p["export_window"], "17:45-18:00")
+        self.assertEqual(p["discharge_current"], 84)
+
+    def test_programmed_start_moves_earlier(self):
+        app = App()
+        sess = session("17:00", "18:00")
+        p = app.predict(sess, local("17:20"), 60, None, {}, {}, programmed_start=local("17:45"))
+        self.assertEqual(p["export_window"], "17:30-18:00")
+
+    def test_programmed_start_kept_once_running(self):
+        app = App()
+        sess = session("17:00", "18:00")
+        p = app.predict(sess, local("17:50"), 45, None, {}, {}, programmed_start=local("17:40"))
+        # 0.75 kWh spare over the last 10 minutes, capped at full rate.
+        self.assertEqual(p["export_window"], "17:40-18:00")
+        self.assertEqual(p["discharge_current"], 90)
 
     def test_dst_change_overnight(self):
         # Clocks go back on 2026-10-25: 23:30 -> 05:30 is 7 real hours.
