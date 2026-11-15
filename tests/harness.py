@@ -361,12 +361,38 @@ class App:
         if tokens is not None:
             self.states[HH_TOKENS] = (str(tokens), {})
 
-    def set_charger(self, switch="on", amps="16", dispatch="on"):
-        for entity, value in ((CHARGER_SWITCH, switch), (CHARGER_CURRENT, amps), (DISPATCH, dispatch)):
+    def set_charger(self, switch="on", amps="16", dispatch="on", dispatches=None, day=6):
+        """
+        The charger and the Octopus dispatch sensor. `dispatches` is a list of
+        ("HH:MM", "HH:MM") planned dispatches on `day`; by default a dispatch
+        that's "on" covers the whole test day and one that's "off" lists none.
+        Pass dispatches=False for a sensor with no dispatch attributes at all.
+        """
+        for entity, value in ((CHARGER_SWITCH, switch), (CHARGER_CURRENT, amps)):
             if value is None:
                 self.states.pop(entity, None)
             else:
                 self.states[entity] = (value, {})
+        if dispatch is None:
+            self.states.pop(DISPATCH, None)
+            return
+        if dispatches is False:
+            self.states[DISPATCH] = (dispatch, {})
+            return
+        if dispatches is None:
+            dispatches = [("00:00", "00:00")] if dispatch == "on" else []
+        planned = []
+        for start, end in dispatches:
+            a = local(start, day)
+            b = local(end, day)
+            if b <= a:
+                b = local(end, day + 1)
+            if (start, end) == ("00:00", "00:00"):
+                a, b = local("00:00", day - 1), local("00:00", day + 2)
+            planned.append({"start": a.astimezone(timezone.utc).isoformat(),
+                            "end": b.astimezone(timezone.utc).isoformat(),
+                            "charge_in_kwh": -1.0, "source": "smart-charge"})
+        self.states[DISPATCH] = (dispatch, {"planned_dispatches": planned, "completed_dispatches": []})
 
     def set_axle(self, kind=None, start=None, end=None, day=6):
         """Axle Energy sensors; kind None means no event (all 'unknown')."""
