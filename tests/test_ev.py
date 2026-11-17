@@ -1,5 +1,6 @@
 """EV-Follow: ported from SolisOctopusEVFollow, on the combined app."""
 import unittest
+from datetime import timezone
 
 from tests.harness import (App, CHARGE_SWITCHES, CHARGE_TIMES, CHARGER_CURRENT, CHARGER_SWITCH,
                            DISPATCH, EV_CONFIG, local)
@@ -41,9 +42,13 @@ class RollingSlotScenarioTests(unittest.TestCase):
             ("14:00", False, None, "00:00-00:00"),
             ("14:12", True, start("14:00-14:30"), "14:00-14:30"),
             ("14:20", True, None, "14:00-14:30"),
-            ("14:27", True, extend("14:00-15:00"), "14:00-15:00"),
+            # Never booked ahead: the next half-hour is added once the car
+            # is seen charging in it.
+            ("14:27", True, None, "14:00-14:30"),
+            ("14:30", True, extend("14:00-15:00"), "14:00-15:00"),
             ("14:45", True, None, "14:00-15:00"),
-            ("14:57", True, extend("14:00-15:30"), "14:00-15:30"),
+            ("14:57", True, None, "14:00-15:00"),
+            ("15:00", True, extend("14:00-15:30"), "14:00-15:30"),
             ("15:10", False, None, "14:00-15:30"),  # car stopped: finish the half-hour
             ("15:25", False, None, "14:00-15:30"),
             ("15:30", False, CLEAR, "00:00-00:00"),  # expired: clear it
@@ -83,45 +88,65 @@ class RollingSlotScenarioTests(unittest.TestCase):
         app.set_charger()
         app.at("14:27")
         app.reconcile()
+        self.assertEqual(app.slot("ev"), "14:00-14:30")
+        app.at("14:30")
+        app.reconcile()
         self.assertEqual(app.slot("ev"), "14:00-15:00")
 
 
 class ExtensionTimingTests(unittest.TestCase):
-    def test_extends_exactly_at_lead_time(self):
+    def test_never_booked_ahead(self):
         app = ev_app()
         app.set_charger()
         app.at("14:05")
         app.reconcile()
-        app.at("14:26", second=59)
+        app.at("14:29", second=59)
         app.reconcile()
         self.assertEqual(app.slot("ev"), "14:00-14:30")
-        app.at("14:27")
+        app.at("14:30")
         app.reconcile()
         self.assertEqual(app.slot("ev"), "14:00-15:00")
 
-    def test_custom_lead_time(self):
-        app = ev_app({"extend_lead_minutes": 5})
+    def test_old_lead_time_option_is_ignored(self):
+        with self.assertLogs("pyscript.solis_octopus", "WARNING") as logs:
+            app = ev_app({"extend_lead_minutes": 5})
+        self.assertTrue(any("extend_lead_minutes" in line for line in logs.output))
         app.set_charger()
         app.at("14:05")
         app.reconcile()
         app.at("14:25")
+        app.reconcile()
+        self.assertEqual(app.slot("ev"), "14:00-14:30")
+
+    def test_continuous_charging_extends_without_waiting_for_debounce(self):
+        app = ev_app(debounce=60)
+        app.set_charger()
+        app.at("14:05")
+        app.reconcile()
+        app.at("14:06")
+        app.reconcile()
+        self.assertEqual(app.slot("ev"), "14:00-14:30")
+        app.at("14:30")
         app.reconcile()
         self.assertEqual(app.slot("ev"), "14:00-15:00")
 
     def test_slot_not_shortened_by_next_check(self):
         app = ev_app()
         app.set_charger()
-        app.at("14:57")
+        app.at("15:00")
         app.reconcile()
-        self.assertEqual(app.slot("ev"), "14:30-15:30")
+        self.assertEqual(app.slot("ev"), "15:00-15:30")
+        app.set_charger(amps="0")
         app.at("15:01")
         app.reconcile()
-        self.assertEqual(app.slot("ev"), "14:30-15:30")
+        self.assertEqual(app.slot("ev"), "15:00-15:30")
 
     def test_slot_never_shrinks_if_clock_goes_backwards(self):
         app = ev_app()
         app.set_charger()
-        app.at("14:57")
+        app.at("14:30")
+        app.reconcile()
+        app.at("15:00")
         app.reconcile()
         app.ops.clear()
         app.at("14:50")
@@ -133,6 +158,108 @@ class ExtensionTimingTests(unittest.TestCase):
         app = ev_app()
         self.assertEqual(app.ev_desired_slot(local("14:12"), False), (None, None))
         self.assertEqual(app.ev_desired_slot(local("14:12"), True), (local("14:00"), local("14:30")))
+        self.assertEqual(app.ev_desired_slot(local("14:29"), True), (local("14:00"), local("14:30")))
+
+
+class DispatchScheduleTests(unittest.TestCase):
+    """Only half-hours with an Octopus dispatch scheduled in them, and the car charging in them."""
+
+    def test_your_14_nov_case_no_dispatch_after_21_00(self):
+        # Dispatch ends at 21:00; the Hypervolt still shows current after it.
+        app = ev_app()
+        app.set_charger(dispatches=[("20:00", "21:00")])
+        app.at("20:10")
+        app.reconcile()
+        self.assertEqual(app.slot("ev"), "20:00-20:30")
+        for hhmm in ("20:30", "20:55", "20:59"):
+            app.at(hhmm)
+            app.reconcile()
+        self.assertEqual(app.slot("ev"), "20:00-21:00")
+        app.ops.clear()
+        for hhmm in ("21:00", "21:01", "21:05"):
+            app.at(hhmm)
+            app.reconcile()
+        self.assertEqual(app.ops, [CLEAR])
+        self.assertEqual(app.slot("ev"), "00:00-00:00")
+        self.assertFalse(app.ev_status()[2]["dispatch_scheduled"])
+
+    def test_dispatch_continuing_extends_at_the_boundary(self):
+        app = ev_app()
+        app.set_charger(dispatches=[("20:00", "21:30")])
+        app.at("20:40")
+        app.reconcile()
+        app.at("20:59")
+        app.reconcile()
+        self.assertEqual(app.slot("ev"), "20:30-21:00")
+        app.at("21:00")
+        app.reconcile()
+        self.assertEqual(app.slot("ev"), "20:30-21:30")
+
+    def test_dispatch_ending_mid_half_hour_keeps_the_whole_half_hour(self):
+        # A dispatch in any part of the half-hour, and the car charged in it: all of it is cheap.
+        app = ev_app()
+        app.set_charger(dispatches=[("20:00", "20:45")])
+        app.at("20:35")
+        app.reconcile()
+        self.assertEqual(app.slot("ev"), "20:30-21:00")
+        app.set_charger(amps="0", dispatches=[("20:00", "20:45")])
+        app.at("20:50")
+        app.reconcile()
+        self.assertEqual(app.slot("ev"), "20:30-21:00")
+
+    def test_dispatch_starting_mid_half_hour_counts(self):
+        app = ev_app()
+        app.set_charger(dispatches=[("20:15", "21:00")])
+        app.at("20:05")
+        app.reconcile()
+        self.assertEqual(app.slot("ev"), "20:00-20:30")
+
+    def test_charging_outside_any_dispatch_never_charges(self):
+        app = ev_app()
+        app.set_charger(dispatches=[("02:00", "03:00")])
+        app.at("19:10")
+        app.reconcile()
+        self.assertEqual(app.ops, [])
+
+    def test_sensor_on_but_no_dispatch_listed_never_charges(self):
+        app = ev_app()
+        app.set_charger(dispatch="on", dispatches=[])
+        app.at("19:10")
+        app.reconcile()
+        self.assertEqual(app.ops, [])
+
+    def test_unreadable_schedule_never_charges(self):
+        app = ev_app()
+        app.set_charger(dispatch="on", dispatches=False)
+        app.at("19:10")
+        app.reconcile()
+        self.assertEqual(app.ops, [])
+        self.assertIsNone(app.ev_status()[2]["dispatch_scheduled"])
+
+    def test_car_not_charging_in_a_scheduled_half_hour_not_used(self):
+        # Scheduled 21:00-21:30, but the car stopped at 20:58: no slot for 21:00.
+        app = ev_app()
+        app.set_charger(dispatches=[("20:00", "21:30")])
+        app.at("20:40")
+        app.reconcile()
+        app.set_charger(amps="0", dispatches=[("20:00", "21:30")])
+        app.at("20:58")
+        app.reconcile()
+        app.ops.clear()
+        app.at("21:00")
+        app.reconcile()
+        self.assertEqual(app.ops, [CLEAR])
+
+    def test_started_and_completed_dispatches_count(self):
+        app = ev_app()
+        app.set_charger()
+        start_utc = local("20:00").astimezone(timezone.utc).isoformat()
+        end_utc = local("21:00").astimezone(timezone.utc).isoformat()
+        app.states[DISPATCH] = ("on", {"planned_dispatches": [],
+                                       "started_dispatches": [{"start": start_utc, "end": end_utc}]})
+        app.at("20:10")
+        app.reconcile()
+        self.assertEqual(app.slot("ev"), "20:00-20:30")
 
 
 class CoreWindowInteractionTests(unittest.TestCase):
@@ -161,7 +288,10 @@ class CoreWindowInteractionTests(unittest.TestCase):
         app.set_charger()
         app.at("05:27", day=7)
         app.reconcile()
-        self.assertEqual(app.ops, [start("05:00-06:00")])
+        self.assertEqual(app.ops, [])  # still in the core window
+        app.at("05:30", day=7)
+        app.reconcile()
+        self.assertEqual(app.ops, [start("05:30-06:00")])
 
     def test_without_core_management_charges_overnight(self):
         app = ev_app({"manage_core_slot": False})
@@ -409,7 +539,8 @@ class CarChargingTests(unittest.TestCase):
         self.app.set_charger(switch="on", amps="16", dispatch="on")
         charging, info = self.app.car_charging()
         self.assertTrue(charging)
-        self.assertEqual(info, {"charger_switch": "on", "charger_amps": 16.0, "dispatch": "on"})
+        self.assertEqual(info, {"charger_switch": "on", "charger_amps": 16.0, "dispatch": "on",
+                                "dispatch_scheduled": True})
 
     def test_drawing_power_without_dispatch_is_ignored(self):
         self.app.set_charger(amps="16", dispatch="off")
@@ -456,8 +587,11 @@ class CarChargingTests(unittest.TestCase):
             "charger_current": "sensor.my_amps",
             "dispatch_sensor": "binary_sensor.my_dispatch",
         })
+        app.at("14:10")
+        dispatch = {"start": local("14:00").astimezone(timezone.utc).isoformat(),
+                    "end": local("15:00").astimezone(timezone.utc).isoformat()}
         app.states.update({"switch.my_charger": ("on", {}), "sensor.my_amps": ("32", {}),
-                           "binary_sensor.my_dispatch": ("on", {})})
+                           "binary_sensor.my_dispatch": ("on", {"planned_dispatches": [dispatch]})})
         self.assertTrue(app.car_charging()[0])
 
 

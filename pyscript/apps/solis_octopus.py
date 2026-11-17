@@ -4,9 +4,10 @@ Solis Octopus (pyscript app)
 One app that owns the Solis battery for everything Octopus (and Axle) related,
 so features never overwrite each other on the inverter:
 
-- EV-Follow: charge the battery from the grid only while the car is really
-  being smart-charged by Octopus Intelligent (charge slot 2), with the core
-  overnight window kept in charge slot 1.
+- EV-Follow: charge the battery from the grid only in half-hours that have an
+  Octopus Intelligent dispatch scheduled in them and in which the car really
+  charges (charge slot 2), never booking the next half-hour ahead, with the
+  core overnight window kept in charge slot 1.
 - Happy Hour: charge at full speed during Octoplus Happy Hours / Power Ups
   (charge slot 3), boost the Cosy hot water, run your start/end actions.
   Optionally move a Renault car's charge schedule into the happy hour and
@@ -47,7 +48,7 @@ from zoneinfo import ZoneInfo
 log = logging.getLogger("pyscript.solis_octopus")
 log.setLevel(logging.DEBUG)
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 # -----------------------------
 # Solis Modbus entities (Grid Time of Use, 6 slots)
@@ -202,7 +203,9 @@ EV_CHARGER_SWITCH = str(EVC.get("charger_switch", "switch.hypervolt_charging"))
 EV_CHARGER_CURRENT = str(EVC.get("charger_current", "sensor.hypervolt_charger_current"))
 EV_MIN_CURRENT_AMPS = float(EVC.get("min_current_amps", 3))
 EV_DEBOUNCE_SECONDS = int(EVC.get("debounce_seconds", 60))
-EV_EXTEND_LEAD_MINUTES = int(EVC.get("extend_lead_minutes", 3))
+if "extend_lead_minutes" in EVC:
+    log.warning("ev_follow.extend_lead_minutes is no longer used: the EV slot only ever covers "
+                "a half-hour once the car is charging in it during a scheduled dispatch")
 MANAGE_CORE_SLOT = _cfg_bool("manage_core_slot", True, EVC) and EV_ENABLED
 
 # --- Happy Hour / Power Up ---
@@ -1777,8 +1780,54 @@ def _state(entity_id):
     return s.state if s else None
 
 
-def car_charging():
-    """True when the charger is drawing current during a *started* Octopus dispatch."""
+def dispatch_windows():
+    """
+    [(start, end)] of every Octopus Intelligent dispatch the dispatch sensor
+    lists (planned, started and completed), or None if it lists none of those
+    attributes, so charging can't be checked against a schedule.
+    """
+    attrs = _attrs(EV_DISPATCH_SENSOR) if EV_DISPATCH_SENSOR else {}
+    found = False
+    out = []
+    for key in ("planned_dispatches", "started_dispatches", "completed_dispatches"):
+        items = attrs.get(key)
+        if items is None:
+            continue
+        found = True
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            start = parse_dt(item.get("start"))
+            end = parse_dt(item.get("end"))
+            if start is not None and end is not None and end > start:
+                out.append((start, end))
+    return out if found else None
+
+
+def dispatch_in_half_hour(dt):
+    """
+    True if an Octopus dispatch is scheduled for any part of the half-hour
+    holding `dt`; None if the dispatch schedule can't be read.
+    """
+    windows = dispatch_windows()
+    if windows is None:
+        return None
+    a = floor_half_hour(dt)
+    b = a + timedelta(minutes=30)
+    for start, end in windows:
+        if overlaps(start, end, a, b):
+            return True
+    return False
+
+
+def car_charging(now=None):
+    """
+    True when the charger is drawing current in a half-hour that has an
+    Octopus dispatch scheduled in it. Octopus bills that whole half-hour at
+    the cheap rate only when both hold, so the charger reading confirms the
+    car really charges in the dispatch; it is never a reason on its own.
+    """
+    now = now or now_local()
     switch_state = _state(EV_CHARGER_SWITCH)
     dispatch_state = _state(EV_DISPATCH_SENSOR)
     current_raw = _state(EV_CHARGER_CURRENT)
@@ -1786,8 +1835,10 @@ def car_charging():
         amps = float(current_raw)
     except (TypeError, ValueError):
         amps = 0.0
-    charging = switch_state == "on" and dispatch_state == "on" and amps >= EV_MIN_CURRENT_AMPS
-    info = {"charger_switch": switch_state, "charger_amps": amps, "dispatch": dispatch_state}
+    scheduled = dispatch_in_half_hour(now)
+    charging = switch_state == "on" and amps >= EV_MIN_CURRENT_AMPS and scheduled is True
+    info = {"charger_switch": switch_state, "charger_amps": amps, "dispatch": dispatch_state,
+            "dispatch_scheduled": scheduled}
     return charging, info
 
 
@@ -1796,7 +1847,7 @@ def ev_charging_confirmed(now):
     (confirmed, info): charging that has lasted at least debounce_seconds, so
     a blip (pre-heating, a short top-up) doesn't start the battery.
     """
-    charging, info = car_charging()
+    charging, info = car_charging(now)
     if not charging:
         _ev["charging_since"] = None
         _ev["debounced"] = False
@@ -1809,21 +1860,28 @@ def ev_charging_confirmed(now):
 
 
 def ev_desired_slot(now, charging):
-    """Return the (start, end) the EV slot should hold right now, or (None, None)."""
-    active = _ev["end"] is not None and now < _ev["end"]
-    lookahead = now + timedelta(minutes=EV_EXTEND_LEAD_MINUTES)
+    """
+    Return the (start, end) the EV slot should hold right now, or (None, None).
 
-    if charging and not ev_in_core_window(lookahead):
-        # End at the next boundary after now+lead, so a few minutes before
-        # :00/:30 this rolls on by another half-hour.
-        end = next_half_hour(lookahead)
-        start = _ev["start"] if active else floor_half_hour(now)
+    The slot only ever covers half-hours that have an Octopus dispatch in them
+    and in which the car has charged: `charging` already means both, for the
+    half-hour holding `now`. The next half-hour is never booked ahead; it's
+    added on the first check inside it, once the car is seen charging there.
+    """
+    active = _ev["end"] is not None and now < _ev["end"]
+    if charging and not ev_in_core_window(now):
+        this_start = floor_half_hour(now)
+        end = next_half_hour(now)
+        # Carry on from the slot just before, so the window grows rather than jumps.
+        contiguous = _ev["start"] is not None and _ev["end"] is not None and _ev["end"] >= this_start
+        start = _ev["start"] if contiguous else this_start
         if active and _ev["end"] > end:
             end = _ev["end"]
         return start, end
 
     if active:
-        # Car stopped (or core window reached): let the current half-hour run out.
+        # The car charged in this half-hour (or the core window is near): the
+        # whole half-hour is cheap, so let it run out.
         return _ev["start"], _ev["end"]
     return None, None
 
@@ -2227,6 +2285,7 @@ def publish_ev_status(info):
             "charger_switch": info.get("charger_switch"),
             "charger_amps": info.get("charger_amps"),
             "dispatch_state": info.get("dispatch"),
+            "dispatch_scheduled": info.get("dispatch_scheduled"),
             "core_window": CORE_WINDOW if MANAGE_CORE_SLOT else None,
             "last_reason": _flags["last_reason"],
             "last_write_ok": _flags["last_write_ok"],

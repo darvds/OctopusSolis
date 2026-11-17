@@ -35,7 +35,11 @@ Before an Axle export event or a Power Down session, earlier export windows **ho
 
 ## The features
 
-**EV-Follow (charge slot 2).** When the charger draws current during a *started* Octopus dispatch, for at least `debounce_seconds`, the slot is set to the current half-hour. A few minutes before each `:00`/`:30` it's extended if the car is still charging. When the car stops, the battery finishes the half-hour, which Octopus bills at the cheap rate, and then stops. The core window `23:30-05:30` lives in charge slot 1.
+**EV-Follow (charge slot 2).** Octopus bills a half-hour at the cheap rate when a dispatch is scheduled in any part of it **and** the car charges in it. So the battery charges in a half-hour only when both hold:
+- the dispatch sensor's `planned_dispatches` (or started/completed dispatches) has a dispatch in that half-hour, and
+- the charger draws current in it, for at least `debounce_seconds`.
+
+The charger reading only confirms the car really charges in a scheduled dispatch; it's never a reason to charge on its own. The slot is set to the current half-hour, and the next half-hour is never booked ahead: it's added on the first check inside it, once the car is seen charging there and a dispatch is scheduled in it. Charging that carries on across the boundary doesn't wait for `debounce_seconds` again. When the car stops, the battery finishes the half-hour (it's already cheap) and then stops. If the dispatch schedule can't be read, the battery doesn't charge. The core window `23:30-05:30` lives in charge slot 1.
 
 **Happy Hour / Power Up (charge slot 3).** Booked sessions, plus Weekend Happy Hours booked automatically if `auto_join` is on, are charged at `charge_current` up to `charge_soc`. When one starts, the Cosy hot water is boosted, your `start_actions` run and you get a notification. `end_actions` run when it ends.
 
@@ -228,7 +232,6 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 | `charger_current` | `sensor.hypervolt_charger_current` | Charger current (A) |
 | `min_current_amps` | `3` | Minimum current that counts as charging |
 | `debounce_seconds` | `60` | How long charging must last before the battery starts |
-| `extend_lead_minutes` | `3` | Extend the slot this early before `:00`/`:30` |
 | `manage_core_slot` | `true` | Program the core window |
 
 **`happy_hour:`**

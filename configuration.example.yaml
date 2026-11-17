@@ -67,7 +67,6 @@ pyscript:
         charger_current: sensor.hypervolt_charger_current
         min_current_amps: 3
         debounce_seconds: 60
-        extend_lead_minutes: 3
         manage_core_slot: true
 
       # --- Happy Hour / Power Up: free electricity ---

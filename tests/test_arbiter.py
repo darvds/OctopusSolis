@@ -147,7 +147,7 @@ class HappyHourTests(unittest.TestCase):
     def test_ev_and_happy_hour_both_charge(self):
         app = all_app({"peak_export": False}, day=10)
         app.set_happy_hours(booked=[hh_event("14:00", "15:00")])
-        app.set_charger()
+        app.set_charger(day=10)
         app.at("14:05", day=10)
         app.reconcile()
         switches = [op for op in app.ops[0] if op[0] == "switch"]
