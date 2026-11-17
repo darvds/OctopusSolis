@@ -74,8 +74,8 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(app.ops, [[("switch", EXPORT_SWITCH, False), ("time", EXPORT_TIME, "00:00-00:00")]])
 
     def test_keep_evening_reserve_option(self):
-        drain = dispatch_app()
-        keep = dispatch_app({"keep_evening_reserve": True})
+        drain = dispatch_app({"pre_charge": False})
+        keep = dispatch_app({"keep_evening_reserve": True, "pre_charge": False})
         for app in (drain, keep):
             app.set_axle("export", "17:30", "18:30")
             app.set_soc(80)

@@ -31,6 +31,7 @@ pyscript:
         ev: 2                   # charge slot: EV-Follow
         happy_hour: 3           # charge slot: happy hours / power ups
         export: 1               # discharge slot: Power Down / peak export
+        axle_charge: 4          # charge slot: Axle pre-charge (axle control: true)
         clear_other_charge_slots: false   # clear unused charge slots once at startup
 
       # --- Battery and export prediction ---
@@ -52,6 +53,7 @@ pyscript:
         max_discharge_amps: 135
         export_limit_kw: 6.0    # your DNO export limit
         discharge_efficiency: 0.95
+        charge_efficiency: 0.95 # sizes the Axle pre-charge
         min_export_kw: 0.2      # don't force a discharge that would barely export
         # Exports run at full rate at the end of a window, with self-use before.
         export_start_step_minutes: 5
@@ -117,6 +119,11 @@ pyscript:
         # Switch the mode in your Axle account first. Never run true while Axle is in Events Only.
         control: false
         keep_evening_reserve: false   # with control: export down to battery.floor_soc
+        # With control: charge from the grid just before an export event, so the battery
+        # can export at full rate for the whole event (Axle pays far more than peak import).
+        pre_charge: true
+        pre_charge_current: 135       # A; defaults to battery.max_discharge_amps
+        pre_charge_min_kwh: 0.5       # ignore smaller shortfalls
         grace_minutes: 10             # Events Only: stay off the inverter this long after an event
         # event_type_sensor: sensor.axle_energy_event_type
         # event_start_sensor: sensor.axle_energy_event_start

@@ -24,7 +24,7 @@ Now one app decides what every slot should hold, in one pass, with one priority 
 
 | | Feature | What happens |
 |---|---|---|
-| 1 | **Axle Energy event** | Depends on your Axle mode (see [Axle Energy](#axle-energy)). With **Self-Dispatch** the app exports during Axle export events itself, and pauses EV and happy hour charging into them. With **Events Only** Axle drives the battery, and the app makes no inverter writes during the event and its grace period. |
+| 1 | **Axle Energy event** | Depends on your Axle mode (see [Axle Energy](#axle-energy)). With **Self-Dispatch** the app tops the battery up just before an Axle export event, exports during it, and pauses EV and happy hour charging into it. With **Events Only** Axle drives the battery, and the app makes no inverter writes during the event and its grace period. |
 | 2 | **EV-Follow charging** | While the car is smart-charging, the battery charges too, and any export window it overlaps is paused for those half-hours. |
 | 3 | **Octopus Power Down** | Exports everything above the evening reserve. It beats happy hour charging if they ever overlap. |
 | 4 | **Happy Hour / Power Up** | Charges at full speed and pauses any overlapping peak export. It can charge alongside EV-Follow. |
@@ -81,6 +81,15 @@ In both modes Axle pays the same way: it credits *"whatever you export to the gr
   - The usual evening reserve isn't kept, because Axle's payment per kWh normally beats what the evening costs. Set `keep_evening_reserve: true` to keep it.
   - Battery is still held back for a later Power Down session before the cheap window.
 - **Before an event**, earlier peak and Power Down windows hold back what the event can export.
+- **Pre-charge** (`pre_charge`, on by default). If the battery won't hold enough at the event start to export at full rate for the whole event, the app charges the shortfall from the grid just before the event, in its own charge slot (`slots: axle_charge`, slot 4).
+  - It works out what the event can export: the full discharge rate (your export limit plus the house, capped by the inverter and battery current), for the length of the event, on top of where the export finishes (the floor, or the evening reserve with `keep_evening_reserve`).
+  - It compares that with the battery it predicts at the event start, and charges the difference at `pre_charge_current`, up to the SOC that covers it.
+  - The charge is timed to **end as the event starts**, starting as late as it can (on a 5-minute step). Charging *during* the event would cancel out export at the meter. While the slot runs, the grid covers the house, so the battery stops draining too.
+  - It charges at whatever the rate is. At Axle's £1/kWh, even peak-rate electricity (~36p, ~40p after losses) leaves about 60p/kWh.
+  - The slot is written `prepare_minutes` ahead and sized from the latest SOC. Before it starts it can move earlier, but never later, and it's dropped if the charge is no longer needed. Once it's running it stays until the event, holding the battery at the target SOC if it gets there early.
+  - Shortfalls under `pre_charge_min_kwh` (0.5 kWh) are ignored. A short-notice event charges as much as fits before it starts.
+  - It never charges from the grid during a Power Down session (it waits until the session ends), and a peak export it overlaps is paused.
+  - The plan shows as `pre_charge_*` (and `battery_at_start_without_pre_charge_kwh`) on `sensor.solis_power_down`, and as `axle_pre_charge` on both sensors. You get one notification when it's armed.
 - **During an export event**, EV-Follow doesn't start or extend its slot. A half-hour that's already running finishes at the event start. A happy hour charges right up to the event start, then stops.
 - **Import events** pause exports. Charging (EV, happy hour) carries on as normal.
 - When the event ends, normal planning resumes straight away, with no grace period.
@@ -196,6 +205,7 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 | `ev` | `2` | Charge slot for EV-Follow |
 | `happy_hour` | `3` | Charge slot for happy hours |
 | `export` | `1` | Discharge slot for exports |
+| `axle_charge` | `4` | Charge slot for the Axle pre-charge (`axle: control: true` with `pre_charge` on) |
 | `clear_other_charge_slots` | `false` | Clear unused charge slots once at startup. Leave it off if Axle or anything else uses them. |
 
 **`battery:`**
@@ -216,6 +226,7 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 | `max_discharge_amps` | `100` | Discharge current limit |
 | `export_limit_kw` | `3.68` | Your export limit |
 | `discharge_efficiency` | `0.95` | Battery-to-AC efficiency |
+| `charge_efficiency` | `0.95` | AC-to-battery efficiency, for sizing the Axle pre-charge |
 | `min_export_kw` | `0.2` | Only export when it exports at least this rate |
 | `export_start_step_minutes` | `5` | The full-rate export starts on a multiple of this many minutes |
 | `stop_soc_margin` | `3` | The slot's stop SOC sits this many % below where the export plans to finish (never below `floor_soc`), so the app ends the export, not the inverter |
@@ -287,12 +298,16 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 | `event_end_sensor` | `sensor.axle_energy_event_end` | Axle event end |
 | `control` | `false` | `true` if your Axle account is in **Self-Dispatch** mode: the app exports during Axle export events. `false` for **Events Only**: Axle drives the battery and the app stands aside. |
 | `keep_evening_reserve` | `false` | With `control: true`: keep the evening reserve during Axle exports instead of exporting down to the floor |
+| `pre_charge` | `true` | With `control: true`: top the battery up from the grid just before an Axle export event, so it can export at full rate for the whole event. See [Axle Energy](#axle-energy). |
+| `pre_charge_current` | `battery.max_discharge_amps` | Charge current (A) for the pre-charge, capped at `max_discharge_kw` |
+| `pre_charge_min_kwh` | `0.5` | Don't pre-charge for a smaller shortfall than this |
+| `pre_charge_step_minutes` | `5` | The pre-charge starts on a multiple of this many minutes |
 | `grace_minutes` | `10` | With `control: false`: stay off the inverter this long after an event |
 
 ## Monitoring
 
 - **`sensor.solis_octopus`**
-  - **State:** `idle`, `charging`, `exporting` or `axle_event`.
+  - **State:** `idle`, `charging` (EV, happy hour or Axle pre-charge), `exporting` or `axle_event`.
   - **Attributes:**
     - `decision`: e.g. "export paused: EV charging"
     - `slots`: what each slot holds

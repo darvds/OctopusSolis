@@ -18,7 +18,10 @@ so features never overwrite each other on the inverter:
   discharge would let the grid cover every load spike above it.
 - Peak export: the same, every day in a peak export window (e.g. 16:00-19:00).
 - Axle Energy: Axle drives the battery itself during its events; the app holds
-  battery back beforehand and keeps off the inverter while they run.
+  battery back beforehand and keeps off the inverter while they run. In
+  Self-Dispatch mode the app exports during Axle export events itself, and
+  tops the battery up from the grid just before one (charge slot 4) when it
+  wouldn't otherwise hold enough to export at full rate for the whole event.
 
 Priority, decided once per pass for all slots together:
     1. Axle event (and grace period): no inverter writes at all.
@@ -48,7 +51,7 @@ from zoneinfo import ZoneInfo
 log = logging.getLogger("pyscript.solis_octopus")
 log.setLevel(logging.DEBUG)
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 # -----------------------------
 # Solis Modbus entities (Grid Time of Use, 6 slots)
@@ -164,6 +167,7 @@ CORE_SLOT = int(SLC.get("core", 1))
 EV_SLOT = int(SLC.get("ev", 2))
 HH_SLOT = int(SLC.get("happy_hour", 3))
 DISCHARGE_SLOT = int(SLC.get("export", 1))
+AXLE_CHARGE_SLOT = int(SLC.get("axle_charge", 4))
 CLEAR_OTHER_SLOTS = _cfg_bool("clear_other_charge_slots", False, SLC)
 
 # --- Battery / prediction ---
@@ -195,6 +199,8 @@ EXPORT_KEEP_START_RATE = float(BAT.get("export_keep_start_rate", 0.8))
 # rest of the slot and the grid covers the house. With the margin, the app
 # ends the export (back to self-use) before the inverter's stop is reached.
 STOP_SOC_MARGIN = max(0, int(BAT.get("stop_soc_margin", 3)))
+# Share of grid energy that ends up in the battery when charging.
+CHARGE_EFFICIENCY = float(BAT.get("charge_efficiency", 0.95))
 
 # --- EV-Follow ---
 EV_ENABLED = _cfg_bool("enabled", bool(EVC), EVC)
@@ -255,6 +261,14 @@ AXLE_GRACE_MINUTES = int(AXC.get("grace_minutes", 10))
 # stands aside.
 AXLE_CONTROL = _cfg_bool("control", False, AXC) and AXLE_EVENTS
 AXLE_KEEP_RESERVE = _cfg_bool("keep_evening_reserve", False, AXC)
+# Self-Dispatch only: before an Axle export event, charge from the grid (at
+# whatever the rate is) whatever the battery would be short of exporting at
+# full rate for the whole event. Axle pays far more per kWh than peak import.
+AXLE_PRE_CHARGE = _cfg_bool("pre_charge", True, AXC) and AXLE_CONTROL
+AXLE_PRE_CHARGE_CURRENT = int(AXC.get("pre_charge_current", MAX_DISCHARGE_AMPS))
+AXLE_PRE_CHARGE_MIN_KWH = float(AXC.get("pre_charge_min_kwh", 0.5))
+# The charge starts on a multiple of this many minutes (rounded earlier).
+AXLE_PRE_CHARGE_STEP_MINUTES = max(1, int(AXC.get("pre_charge_step_minutes", 5)))
 
 # --- Renault car charge schedule (moved into happy hours, back to normal after) ---
 RENAULT_ENABLED = _cfg_bool("enabled", bool(RNC), RNC)
@@ -297,6 +311,8 @@ def _slot_problems():
         charge.append(("ev", EV_SLOT))
     if HH_BATTERY_CHARGE:
         charge.append(("happy_hour", HH_SLOT))
+    if AXLE_PRE_CHARGE:
+        charge.append(("axle_charge", AXLE_CHARGE_SLOT))
     for name, num in charge + [("export", DISCHARGE_SLOT)]:
         if not 1 <= num <= 6:
             problems.append(f"slots.{name} must be 1-6, not {num}")
@@ -329,6 +345,7 @@ SLOT_DEFS = {
     "ev": ("charge", EV_SLOT),
     "happy_hour": ("charge", HH_SLOT),
     "export": ("discharge", DISCHARGE_SLOT),
+    "axle_charge": ("charge", AXLE_CHARGE_SLOT),
 }
 
 
@@ -338,7 +355,7 @@ def _empty_program():
 
 
 _slots = {"core": _empty_program(), "ev": _empty_program(), "happy_hour": _empty_program(),
-          "export": _empty_program()}
+          "export": _empty_program(), "axle_charge": _empty_program()}
 _cache = {"prefix": None, "entities": {}, "load_profile": None, "load_profile_at": None}
 _flags = {"busy": False, "write_lock": False, "started": False, "last_reason": None,
           "last_write_ok": None, "pd_warned_at": None, "hh_warned_at": None, "axle_warned_at": None,
@@ -352,9 +369,12 @@ _hh_seen = {"announced": set(), "running": {}}
 # EV-Follow: the programmed EV window as datetimes, and when charging was first seen.
 _ev = {"start": None, "end": None, "charging_since": None, "debounced": False, "last_charging": None,
        "info": {}}
-_last = {"plan": None, "export_window": None, "hh_window": None, "decision": None}
+_last = {"plan": None, "export_window": None, "hh_window": None, "decision": None,
+         "pre_charge": None}
 # The export we programmed: its window id and when its full-rate discharge starts.
 _export_run = {"id": None, "start": None}
+# The Axle pre-event charge we programmed: the event's id, its start and stop SOC.
+_pre_charge_run = {"id": None, "start": None, "soc": None}
 # Renault: the schedule we last set on the car (None = unknown, e.g. after a
 # restart, so it's written), and the retry state for the one we want.
 _car = {"applied": None, "applied_mode": None, "wanted": None, "failed_at": None, "failures": 0,
@@ -1091,7 +1111,7 @@ def solar_forecast():
 
 
 def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_to_floor=False,
-            programmed_start=None):
+            programmed_start=None, pre_charge=False):
     """
     Plan the export for the window `session`. All energies in kWh, powers in kW.
     `soc` is the battery SOC now (%), `load_profile` {local hour: kW},
@@ -1106,6 +1126,11 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_t
     the window ends, at the reserve. `programmed_start` is the start already
     on the inverter: once it has begun, the current is re-planned to land on
     the reserve at the end of the window, without moving the start.
+
+    `pre_charge` (Axle export events the app runs): when the battery is
+    predicted to start the window short of what it can export at full rate
+    for the whole window, plan a grid charge that ends as the window starts,
+    and plan the export as if it happened.
     """
     cap = BATTERY_CAPACITY_KWH
 
@@ -1144,7 +1169,11 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_t
     core_end = last_core_end_between(now, start)
     if core_end is not None:
         base_time, base_soc = core_end, max(soc, CORE_CHARGE_SOC)
-    battery_at_start = max(0.0, min(cap, base_soc / 100.0 * cap - net_drain(base_time, start)))
+    def battery_at(t):
+        """The battery at `t` (from base_time on) if nothing charges or exports."""
+        return max(0.0, min(cap, base_soc / 100.0 * cap - net_drain(base_time, t)))
+
+    battery_at_start = battery_at(start)
 
     # Reserve: the floor, plus the house from session end until the cheap window.
     floor_kwh = FLOOR_SOC / 100.0 * cap
@@ -1177,12 +1206,46 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_t
         load_kwh += load_kw(t) * h
         solar_kwh += solar_kw(t) * h
 
-    spare_kwh = max(0.0, battery_at_start - target_kwh)
     full_kw = 0.0
     if hours > 0:
         # Battery power that would push exactly the export limit out.
         export_cap_kw = max(0.0, (EXPORT_LIMIT_KW + (load_kwh - solar_kwh) / hours) / DISCHARGE_EFFICIENCY)
         full_kw = min(MAX_DISCHARGE_KW, MAX_DISCHARGE_AMPS * volts / 1000.0, export_cap_kw)
+
+    # Top up before the window: enough for full rate from start to end.
+    pc = {"pre_charge_kwh": 0.0, "pre_charge_start": None, "pre_charge_window": None,
+          "pre_charge_soc": None, "pre_charge_current": None, "pre_charge_needed_kwh": None}
+    without_pre_charge_kwh = battery_at_start
+    if pre_charge and now < session["start"] and hours > 0 and full_kw > 0 and cap > 0:
+        wanted_kwh = min(cap, target_kwh + full_kw * hours)
+        shortfall = wanted_kwh - battery_at_start
+        pc["pre_charge_needed_kwh"] = round(max(0.0, shortfall), 2)
+        charge_kw = min(MAX_DISCHARGE_KW, AXLE_PRE_CHARGE_CURRENT * volts / 1000.0) * CHARGE_EFFICIENCY
+        if shortfall >= AXLE_PRE_CHARGE_MIN_KWH and charge_kw > 0:
+            # While a timed charge runs, the grid covers the house, so the
+            # battery only drains until the charge starts. Find the latest
+            # start that still reaches wanted_kwh by the window's start.
+            earliest = max(now, base_time)
+            charge_start = start
+            for _ in range(6):
+                need = max(0.0, wanted_kwh - battery_at(max(earliest, charge_start)))
+                charge_start = start - timedelta(hours=need / charge_kw)
+            local = to_local(max(earliest, charge_start)).replace(second=0, microsecond=0)
+            local -= timedelta(minutes=local.minute % AXLE_PRE_CHARGE_STEP_MINUTES)
+            charge_start = local
+            charged_hrs = (start - max(now, charge_start)).total_seconds() / 3600.0
+            reached = min(wanted_kwh, battery_at(max(earliest, charge_start)) + charge_kw * charged_hrs)
+            if reached > battery_at_start:
+                pc.update({
+                    "pre_charge_kwh": round(reached - battery_at(max(earliest, charge_start)), 2),
+                    "pre_charge_start": charge_start.isoformat(),
+                    "pre_charge_window": fmt_window(charge_start, session["start"]),
+                    "pre_charge_soc": min(100, int(math.ceil(wanted_kwh / cap * 100.0 - 1e-6))),
+                    "pre_charge_current": AXLE_PRE_CHARGE_CURRENT,
+                })
+                battery_at_start = reached
+
+    spare_kwh = max(0.0, battery_at_start - target_kwh)
 
     def self_use(a, b):
         """Battery used in self-use over [a, b): the house, less any solar surplus it soaks up."""
@@ -1261,7 +1324,7 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_t
 
     avoided_kwh = max(0.0, load_kwh - import_kwh)
 
-    return {
+    result = {
         "session_start": session["start"].isoformat(),
         "session_end": session["end"].isoformat(),
         "window": fmt_window(session["start"], session["end"]),
@@ -1269,6 +1332,7 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_t
         "window_id": session.get("id"),
         "hours": round(hours, 3),
         "battery_at_start_kwh": round(battery_at_start, 2),
+        "battery_at_start_without_pre_charge_kwh": round(without_pre_charge_kwh, 2),
         "reserve_kwh": round(reserve_kwh, 2),
         "target_kwh": round(target_kwh, 2),
         "held_for_power_down_kwh": round(held_kwh, 2),
@@ -1289,16 +1353,20 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_t
         "estimated_octopoints": int(round(avoided_kwh * session.get("octopoints_per_kwh", 0))),
         "estimated_export_value_pence": round(value_pence, 1),
     }
+    result.update(pc)
+    return result
 
 
-async def plan_for(session, now, later=None, drain_to_floor=False, programmed_start=None):
+async def plan_for(session, now, later=None, drain_to_floor=False, programmed_start=None,
+                   pre_charge=False):
     soc = _float_state(SOC_SENSOR)
     if soc is None:
         log.warning("SOC sensor '%s' unavailable; can't plan", SOC_SENSOR)
         return None
     voltage = _float_state(BATTERY_VOLTAGE_SENSOR)
     profile = await ensure_load_profile()
-    return predict(session, now, soc, voltage, profile, solar_forecast(), later, drain_to_floor, programmed_start)
+    return predict(session, now, soc, voltage, profile, solar_forecast(), later, drain_to_floor,
+                   programmed_start, pre_charge)
 
 
 def worth_exporting(plan):
@@ -1341,6 +1409,70 @@ def export_desired(session, plan, now):
         "enabled": True,
         "start": start,
     }
+
+
+def pre_charge_event(export_window, later):
+    """(event, later after it): the next Axle export event to top the battery up for, or (None, [])."""
+    if not AXLE_PRE_CHARGE:
+        return None, []
+    if axle_dispatch(export_window):
+        return export_window, later
+    for i, w in enumerate(later or []):
+        if axle_dispatch(w):
+            return w, later[i + 1:]
+    return None, []
+
+
+def pre_charge_desired(event, plan, now):
+    """What the Axle pre-charge slot should hold right now."""
+    if event is None or now >= event["start"]:
+        return empty_want()
+    program = _slots["axle_charge"]
+    ours = (_pre_charge_run["id"] == event["id"] and _pre_charge_run["start"] is not None
+            and program["enabled"] and not program["unknown"])
+    planned = parse_dt(plan.get("pre_charge_start")) if plan else None
+    soc = plan.get("pre_charge_soc") if plan else None
+    if ours and _pre_charge_run["start"] <= now:
+        # Charging has begun: keep it to the event start, even once the battery
+        # is full enough (the slot then holds the SOC until the event).
+        start = _pre_charge_run["start"]
+        soc = max(_pre_charge_run["soc"] or 0, soc or 0)
+    elif planned is None:
+        return empty_want()
+    else:
+        start = planned
+        if ours and _pre_charge_run["start"] < start:
+            # Never move a programmed charge later: a bit of extra charging
+            # stops at the SOC anyway, and it saves rewriting every minute.
+            start = _pre_charge_run["start"]
+        if now < start - timedelta(minutes=EXPORT_PREPARE_MINUTES):
+            return empty_want()
+    return {"window": fmt_window(start, event["start"]), "current": AXLE_PRE_CHARGE_CURRENT,
+            "soc": int(soc or 100), "enabled": True, "start": start, "end": event["start"]}
+
+
+def pre_charge_clash(pc_want, export_window, export_want, now):
+    """
+    (pc_want, export_want, note) once the pre-charge is fitted around an earlier
+    export window: a peak export it overlaps is paused, and it never charges
+    from the grid during a Power Down session (it starts when the session ends).
+    """
+    if not pc_want["enabled"] or export_window is None or axle_dispatch(export_window) \
+            or is_axle(export_window):
+        return pc_want, export_want, None
+    if not overlaps(pc_want["start"], pc_want["end"], export_window["start"], export_window["end"]):
+        return pc_want, export_want, None
+    if export_window["kind"] == "power_down":
+        start = export_window["end"]
+        if start >= pc_want["end"]:
+            return empty_want(), export_want, "Axle pre-charge skipped: Power Down"
+        pc_want = dict(pc_want, start=start, window=fmt_window(start, pc_want["end"]))
+        if now < start - timedelta(minutes=EXPORT_PREPARE_MINUTES):
+            pc_want = empty_want()
+        return pc_want, export_want, "Axle pre-charge waits for Power Down"
+    if export_want["enabled"]:
+        return pc_want, empty_want(), "peak export paused: Axle pre-charge"
+    return pc_want, export_want, None
 
 
 # -----------------------------
@@ -1986,8 +2118,10 @@ def active_slot_keys():
         keys.append("ev")
     if HH_BATTERY_CHARGE:
         keys.append("happy_hour")
-    if PD_ENABLED or PEAK_EXPORT:
+    if PD_ENABLED or PEAK_EXPORT or AXLE_CONTROL:
         keys.append("export")
+    if AXLE_PRE_CHARGE:
+        keys.append("axle_charge")
     return keys
 
 
@@ -2110,12 +2244,22 @@ async def _reconcile(reason):
     if export_window is not None and (not is_axle(export_window) or axle_dispatch(export_window)):
         plan = await plan_for(export_window, now, later,
                               drain_to_floor=axle_dispatch(export_window) and not AXLE_KEEP_RESERVE,
-                              programmed_start=programmed_export_start(export_window))
+                              programmed_start=programmed_export_start(export_window),
+                              pre_charge=AXLE_PRE_CHARGE and axle_dispatch(export_window))
     export_want = export_desired(export_window, plan, now)
+    pc_event, pc_later = pre_charge_event(export_window, later)
+    pc_plan = None
+    if pc_event is not None and pc_event is export_window:
+        pc_plan = plan
+    elif pc_event is not None:
+        pc_plan = await plan_for(pc_event, now, pc_later, drain_to_floor=not AXLE_KEEP_RESERVE,
+                                 pre_charge=True)
+    pc_want = pre_charge_desired(pc_event, pc_plan, now) if AXLE_PRE_CHARGE else empty_want()
 
     axle_running = stand_aside(export_window, now)
     notes = []
-    wants = {"core": core_want(), "ev": ev_want, "happy_hour": hh_want, "export": export_want}
+    wants = {"core": core_want(), "ev": ev_want, "happy_hour": hh_want, "export": export_want,
+             "axle_charge": pc_want}
     per_slot = {}
     if axle_running:
         # Axle is driving the battery: stay off the inverter. The only write
@@ -2128,9 +2272,13 @@ async def _reconcile(reason):
     else:
         ev_want, hh_want, export_want, notes = arbitrate(now, ev_want, ev_on, hh_window, hh_want,
                                                          export_window, export_want)
+        pc_want, export_want, pc_note = pre_charge_clash(pc_want, export_window, export_want, now)
+        if pc_note:
+            notes.append(pc_note)
         wants["ev"] = ev_want
         wants["happy_hour"] = hh_want
         wants["export"] = export_want
+        wants["axle_charge"] = pc_want
         for key in active_slot_keys():
             step = CURRENT_STEP_AMPS if key == "export" else 1
             per_slot[key] = slot_ops(key, wants[key], step)
@@ -2151,7 +2299,8 @@ async def _reconcile(reason):
             if CLEAR_OTHER_SLOTS and not axle_running:
                 _flags["others_cleared"] = True
             ends = {"ev": ev_want.get("end"), "happy_hour": hh_window["end"] if hh_window else None,
-                    "export": export_window["end"] if export_window else None}
+                    "export": export_window["end"] if export_window else None,
+                    "axle_charge": pc_want.get("end")}
             for key in per_slot:
                 if per_slot[key]:
                     apply_slot_ops(key, per_slot[key], ends.get(key))
@@ -2160,6 +2309,12 @@ async def _reconcile(reason):
                     _export_run["id"], _export_run["start"] = export_window["id"], wants["export"]["start"]
                 else:
                     _export_run["id"], _export_run["start"] = None, None
+            if per_slot.get("axle_charge"):
+                if wants["axle_charge"]["enabled"]:
+                    _pre_charge_run.update({"id": pc_event["id"], "start": wants["axle_charge"]["start"],
+                                            "soc": wants["axle_charge"]["soc"]})
+                else:
+                    _pre_charge_run.update({"id": None, "start": None, "soc": None})
             if per_slot.get("ev"):
                 # EV-Follow remembers the window it programmed, so it can extend it.
                 if wants["ev"]["enabled"]:
@@ -2167,6 +2322,7 @@ async def _reconcile(reason):
                 else:
                     _ev["start"], _ev["end"] = None, None
             await after_write(now, wants, export_window, plan)
+            await after_pre_charge_write(wants, pc_event, pc_plan)
         else:
             # Partial writes leave the inverter in an unknown state; rewrite it all next time.
             for key in per_slot:
@@ -2189,6 +2345,7 @@ async def _reconcile(reason):
     _last["export_window"] = export_window
     _last["hh_window"] = hh_window
     _last["decision"] = "; ".join(notes) or None
+    _last["pre_charge"] = pre_charge_summary(pc_event, pc_plan, wants["axle_charge"])
     _flags["last_reason"] = reason
     publish_all(now, export_window, plan, hh_window, hh_windows, ev_info,
                 pd_status, hh_status, axle_status)
@@ -2214,6 +2371,41 @@ async def after_write(now, wants, export_window, plan):
         f"stopping at {plan['stop_soc']}% "
         f"({plan['reserve_kwh']} kWh kept {kept}).",
     )
+
+
+async def after_pre_charge_write(wants, event, plan):
+    """One notification once an Axle pre-charge is armed."""
+    want = wants["axle_charge"]
+    if not want["enabled"] or event is None:
+        return
+    key = f"{event['id']}-pre-charge"
+    if key in _pd_joined["notified"]:
+        return
+    _pd_joined["notified"].add(key)
+    kwh = plan.get("pre_charge_kwh") if plan else None
+    await notify(
+        "Axle pre-charge planned",
+        f"Charging the battery {fmt_window(want['start'], want['end'])} at {want['current']} A, "
+        f"up to {want['soc']}%" + (f" (~{kwh} kWh)" if kwh else "")
+        + f", for the Axle export {fmt_window(event['start'], event['end'])}.",
+    )
+
+
+def pre_charge_summary(event, plan, want):
+    """The Axle pre-charge, for the status sensors."""
+    if not AXLE_PRE_CHARGE or event is None:
+        return None
+    program = _slots["axle_charge"]
+    return {
+        "event": fmt_window(event["start"], event["end"]),
+        "needed_kwh": plan.get("pre_charge_needed_kwh") if plan else None,
+        "planned_kwh": plan.get("pre_charge_kwh") if plan else None,
+        "planned_window": plan.get("pre_charge_window") if plan else None,
+        "target_soc": plan.get("pre_charge_soc") if plan else None,
+        "programmed_window": program["window"] if program["enabled"] else None,
+        "programmed_soc": program["soc"] if program["enabled"] else None,
+        "charge_slot": AXLE_CHARGE_SLOT,
+    }
 
 
 # -----------------------------
@@ -2245,7 +2437,9 @@ def publish_overview(now, export_window, hh_window):
     elif export_started(export_window, now):
         state_value = "exporting"
     elif (_slots["ev"]["enabled"] and _ev["end"] is not None and now < _ev["end"]) or \
-            (_slots["happy_hour"]["enabled"] and is_running(hh_window, now)):
+            (_slots["happy_hour"]["enabled"] and is_running(hh_window, now)) or \
+            (_pre_charge_run["start"] is not None and _pre_charge_run["start"] <= now
+             and still_running("axle_charge", now)):
         state_value = "charging"
     else:
         state_value = "idle"
@@ -2254,6 +2448,7 @@ def publish_overview(now, export_window, hh_window):
         slots[key] = _slot_attrs(key)
     state.set(OVERVIEW_SENSOR, state_value, new_attributes={
         "decision": _last["decision"],
+        "axle_pre_charge": _last["pre_charge"],
         "slots": slots,
         "features": {"ev_follow": EV_ENABLED, "happy_hour": HH_ENABLED, "power_down": PD_ENABLED,
                      "peak_export": PEAK_EXPORT, "axle": AXLE_EVENTS,
@@ -2407,6 +2602,8 @@ def publish_export_status(session, plan, now, events_status="ok", axle_status="d
         attrs["axle_event_start"] = to_local(session["start"]).isoformat()
         attrs["axle_event_end"] = to_local(session["event_end"]).isoformat()
         attrs["axle_control"] = AXLE_CONTROL
+    if _last["pre_charge"] is not None:
+        attrs["axle_pre_charge"] = _last["pre_charge"]
     warnings = []
     if not INVERTER_CONTROL:
         warnings.append(control_off_warning())
@@ -2576,8 +2773,17 @@ async def solis_octopus_preview():
                  export_window["kind"][len("axle_"):], fmt_window(export_window["start"], export_window["end"]))
     else:
         plan = await plan_for(export_window, now, later,
-                              drain_to_floor=axle_dispatch(export_window) and not AXLE_KEEP_RESERVE)
+                              drain_to_floor=axle_dispatch(export_window) and not AXLE_KEEP_RESERVE,
+                              pre_charge=AXLE_PRE_CHARGE and axle_dispatch(export_window))
         log.info("Preview export %s: %s", fmt_window(export_window["start"], export_window["end"]), plan)
+    pc_event, pc_later = pre_charge_event(export_window, later)
+    if pc_event is not None and pc_event is not export_window:
+        pc_plan = await plan_for(pc_event, now, pc_later, drain_to_floor=not AXLE_KEEP_RESERVE, pre_charge=True)
+        summary = {}
+        for key, value in (pc_plan or {}).items():
+            if key.startswith("pre_charge"):
+                summary[key] = value
+        log.info("Preview Axle pre-charge for %s: %s", fmt_window(pc_event["start"], pc_event["end"]), summary)
     if HH_ENABLED:
         windows = happy_hours()
         _, hh_available = hh_sessions()
