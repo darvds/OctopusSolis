@@ -48,9 +48,9 @@ pyscript:
         #   - sensor.solcast_pv_forecast_forecast_tomorrow
         # voltage_sensor: sensor.solis_battery_voltage
         voltage: 51.2
-        max_discharge_kw: 5.0
-        max_discharge_amps: 100
-        export_limit_kw: 3.68   # your DNO export limit
+        max_discharge_kw: 6.0
+        max_discharge_amps: 135
+        export_limit_kw: 6.0    # your DNO export limit
         discharge_efficiency: 0.95
         min_export_kw: 0.2      # don't force a discharge that would barely export
         # Exports run at full rate at the end of a window, with self-use before.
