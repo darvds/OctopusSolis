@@ -355,7 +355,7 @@ SLOT_DEFS = {
 
 def _empty_program():
     return {"window": EMPTY_SLOT, "current": None, "soc": None, "enabled": False, "unknown": True,
-            "ends": None}
+            "ends": None, "written_at": None}
 
 
 _slots = {"core": _empty_program(), "ev": _empty_program(), "happy_hour": _empty_program(),
@@ -2149,6 +2149,37 @@ def apply_slot_ops(key, ops, ends=None):
     elif ends is not None:
         program["ends"] = ends
     program["unknown"] = False
+    program["written_at"] = now_local()
+
+
+# Give Solis Modbus this long after a write to show the new values before
+# checking them against what we wrote.
+DRIFT_SETTLE = timedelta(seconds=90)
+# Rewrite the same difference at most this many times in a row.
+DRIFT_MAX_REWRITES = 3
+_drift_seen = {}
+
+
+def slot_drift(key, now):
+    """
+    Where the inverter's live slot differs from what we last wrote to it, as
+    [(entity, live, ours)]. Something else changed it (Axle, the Solis app, a
+    write that didn't take), and the slot must be rewritten.
+    """
+    have = _slots[key]
+    if have["unknown"] or (have.get("written_at") is not None and now - have["written_at"] < DRIFT_SETTLE):
+        return []
+    _, current_id, soc_id, switch_id = slot_entities(key)
+    out = []
+    live_on = switch_is(switch_id)
+    if live_on is not None and live_on != have["enabled"]:
+        out.append((switch_id, "on" if live_on else "off", "on" if have["enabled"] else "off"))
+    if have["enabled"]:
+        for entity_id, ours in ((soc_id, have["soc"]), (current_id, have["current"])):
+            live = _float_state(entity_id)
+            if ours is not None and live is not None and not _same_number(live, ours):
+                out.append((entity_id, live, ours))
+    return out
 
 
 def still_running(key, now):
@@ -2345,6 +2376,22 @@ async def _reconcile(reason):
         wants["export"] = export_want
         wants["axle_charge"] = pc_want
         for key in active_slot_keys():
+            drift = slot_drift(key, now)
+            text = ", ".join(f"{e} is {live}, we wrote {ours}" for e, live, ours in drift)
+            seen = _drift_seen.get(key)
+            if not drift:
+                _drift_seen.pop(key, None)
+            elif seen is not None and seen[0] == text and seen[1] >= DRIFT_MAX_REWRITES:
+                # The inverter won't take it (e.g. clamps the value): stop rewriting every check.
+                notes.append(f"{key} slot differs on the inverter and won't take our value")
+            else:
+                count = seen[1] + 1 if seen is not None and seen[0] == text else 1
+                _drift_seen[key] = (text, count)
+                log_fn = log.error if count >= DRIFT_MAX_REWRITES else log.warning
+                log_fn("[%s] %s slot changed on the inverter: %s; rewriting it (%s/%s)", reason, key,
+                       text, count, DRIFT_MAX_REWRITES)
+                notes.append(f"{key} slot changed on the inverter; rewritten")
+                _slots[key]["unknown"] = True
             step = CURRENT_STEP_AMPS if key == "export" else 1
             per_slot[key] = slot_ops(key, wants[key], step)
         if not wants["export"]["enabled"] and export_window is not None \

@@ -132,6 +132,7 @@ The app drives the inverter only through the [Solis Modbus](https://github.com/P
 
 - Writes use the standard `time.set_value`, `number.set_value` and `switch.turn_on` / `turn_off` actions, one at a time, under one lock.
 - A slot is switched off before it's cleared, and only switched on once its window, current and SOC are written. A failed write stops the batch, so a half-written slot is never switched on. It's retried at the next check.
+- Every check, the app compares its slots' switch, current and stop SOC with what Solis Modbus shows. If something else changed them (Axle, the Solis app, a write that didn't take), the slot is rewritten and the change is logged. It waits 90 s after a write before checking, and stops after 3 rewrites in a row of the same difference, in case the inverter won't take a value.
 - Switches already in the right state aren't written again. Solis Modbus keeps the other slots' on/off bits as they are.
 - Entities created by older Solis Modbus versions keep their old IDs (e.g. `switch.solis_solis_grid_time_of_use_charging_period_1`). When the exact ID isn't there, the app uses the one entity whose ID ends the same way, and logs which one.
 - The prefix comes from the inverter's device name in Solis Modbus. It's found automatically from `time.*_grid_time_of_use_charge_start_slot_1`. With more than one inverter, set `inverter_prefix`.
@@ -335,6 +336,7 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 
 - **A feature isn't doing anything.** Check the `features` attribute on `sensor.solis_octopus`. Then check the `*_events` health attributes on its own sensor. A typo in an entity ID shows as `missing`, with a `warning`.
 - **"Not starting: fix the slots config first".** Two features are set to the same charge slot. The details are in `slot_problems` on `sensor.solis_octopus`.
+- **The export slot is on but the battery doesn't discharge.** Check the slot's stop SOC on the inverter. The app now rewrites it if it differs from what it wrote; look for "slot changed on the inverter" in the log and `decision`.
 - **Slots at the wrong times.** Check the inverter clock (Solis Modbus's clock sync) and `inverter_timezone`.
 - **"Solis Modbus entities missing or unavailable".** The log names them. Check the Solis Modbus integration is connected, isn't in read-only mode, and shows the *Grid Time of Use* entities for your inverter. If your entity IDs start with something other than the detected prefix, set `inverter_prefix`.
 - **Axle's settings get overwritten (Events Only).** Make sure Axle doesn't use the same Solis slots as this app, and change `slots:` if it does. Or switch Axle to Self-Dispatch and set `axle: control: true`.
