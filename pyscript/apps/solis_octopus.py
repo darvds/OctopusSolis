@@ -1216,7 +1216,8 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_t
     battery_at_start = battery_at(start)
 
     # Reserve: the floor, plus the house from session end until the cheap window.
-    floor_kwh = FLOOR_SOC / 100.0 * cap
+    floor_soc = max(FLOOR_SOC, MIN_CUT_OFF_SOC)
+    floor_kwh = floor_soc / 100.0 * cap
     if drain_to_floor or in_core_window(end):
         evening_kwh = 0.0
     else:
@@ -1237,12 +1238,15 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_t
     def reserve_for(held):
         """(reserve, stop SOC, target) with `held` kWh kept back for later windows."""
         reserve = min(cap, floor_kwh + RESERVE_MARGIN * evening_kwh + held)
-        # The inverter's stop SOC: STOP_SOC_MARGIN below the reserve, never below
-        # the floor. The plan finishes at least that margin above it.
+        # The inverter's stop SOC: STOP_SOC_MARGIN below the reserve, so the app
+        # ends the export, not the inverter. At the floor there's nothing to
+        # keep a margin for: the stop is the floor and the plan finishes there.
         stop = 100
         if cap > 0:
             stop = int(math.floor(reserve / cap * 100.0 + 1e-6)) - STOP_SOC_MARGIN
-        stop = max(FLOOR_SOC, MIN_CUT_OFF_SOC, min(100, stop))
+        if stop <= floor_soc:
+            return reserve, floor_soc, min(cap, max(reserve, floor_kwh))
+        stop = min(100, stop)
         return reserve, stop, min(cap, max(reserve, (stop + STOP_SOC_MARGIN) / 100.0 * cap))
 
     reserve_kwh, stop_soc, target_kwh = reserve_for(held_kwh)
