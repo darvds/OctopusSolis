@@ -241,6 +241,10 @@ NOTIFY_END = _cfg_bool("notify_end", True, HHC)
 PD_ENABLED = _cfg_bool("enabled", bool(PDC), PDC)
 PD_EVENTS_ENTITY = str(PDC.get("power_down_events_entity", "")) if PD_ENABLED else ""
 PD_AUTO_JOIN = _cfg_bool("auto_join", True, PDC)
+# Always export at least this much in a Power Down session (it earns the
+# session's token), releasing battery held back for an Axle export event that
+# the pre-charge tops up again anyway.
+PD_MIN_EXPORT_KWH = max(0.0, float(PDC.get("min_export_kwh", 0.5)))
 
 # --- Peak export ---
 PEAK_EXPORT = _cfg_bool("enabled", bool(PKC), PKC)
@@ -1110,6 +1114,39 @@ def solar_forecast():
     return out
 
 
+def min_export_battery_kwh(start, end, full_kw, load_kw, solar_kw, export_kwh):
+    """
+    The battery energy a window [start, end) needs to export `export_kwh`, with
+    self-use until the full-rate discharge and full rate (`full_kw`) to the end.
+    The whole window at full rate if even that falls short.
+    """
+    def exported_from(x):
+        total = 0.0
+        for t, h in periods(x, end):
+            net = full_kw * DISCHARGE_EFFICIENCY + solar_kw(t) - load_kw(t)
+            total += min(EXPORT_LIMIT_KW, max(0.0, net)) * h
+        return total
+
+    def battery_from(x):
+        total = 0.0
+        for t, h in periods(start, x):
+            total += max(0.0, load_kw(t) - solar_kw(t)) * h
+        for _, h in periods(x, end):
+            total += full_kw * h
+        return total
+
+    if exported_from(start) <= export_kwh:
+        return battery_from(start)
+    lo, hi = start, end  # exported_from(lo) > export_kwh >= exported_from(hi)
+    for _ in range(30):
+        mid = lo + (hi - lo) / 2
+        if exported_from(mid) >= export_kwh:
+            lo = mid
+        else:
+            hi = mid
+    return battery_from(lo)
+
+
 def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_to_floor=False,
             programmed_start=None, pre_charge=False):
     """
@@ -1184,18 +1221,28 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_t
     # Power Down first: keep what later Power Down sessions can export. Their
     # house load is already in the evening reserve.
     held_kwh = 0.0
+    # Of that, what's held for Axle export events the pre-charge tops up.
+    refillable_kwh = 0.0
     for w in later or []:
         if w.get("kind") in ("power_down", "axle_export"):
             kw, hrs = max_battery_kw(max(w["start"], end), w["end"])
-            held_kwh += max(0.0, kw * hrs - net_drain(max(w["start"], end), w["end"]))
-    reserve_kwh = min(cap, floor_kwh + RESERVE_MARGIN * evening_kwh + held_kwh)
-    # The inverter's stop SOC: STOP_SOC_MARGIN below the reserve, never below
-    # the floor. The plan finishes at least that margin above it.
-    stop_soc = 100
-    if cap > 0:
-        stop_soc = int(math.floor(reserve_kwh / cap * 100.0 + 1e-6)) - STOP_SOC_MARGIN
-    stop_soc = max(FLOOR_SOC, min(100, stop_soc))
-    target_kwh = min(cap, max(reserve_kwh, (stop_soc + STOP_SOC_MARGIN) / 100.0 * cap))
+            held = max(0.0, kw * hrs - net_drain(max(w["start"], end), w["end"]))
+            held_kwh += held
+            if AXLE_PRE_CHARGE and axle_dispatch(w):
+                refillable_kwh += held
+
+    def reserve_for(held):
+        """(reserve, stop SOC, target) with `held` kWh kept back for later windows."""
+        reserve = min(cap, floor_kwh + RESERVE_MARGIN * evening_kwh + held)
+        # The inverter's stop SOC: STOP_SOC_MARGIN below the reserve, never below
+        # the floor. The plan finishes at least that margin above it.
+        stop = 100
+        if cap > 0:
+            stop = int(math.floor(reserve / cap * 100.0 + 1e-6)) - STOP_SOC_MARGIN
+        stop = max(FLOOR_SOC, min(100, stop))
+        return reserve, stop, min(cap, max(reserve, (stop + STOP_SOC_MARGIN) / 100.0 * cap))
+
+    reserve_kwh, stop_soc, target_kwh = reserve_for(held_kwh)
 
     session_periods = periods(start, end)
     hours = 0.0
@@ -1211,6 +1258,23 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_t
         # Battery power that would push exactly the export limit out.
         export_cap_kw = max(0.0, (EXPORT_LIMIT_KW + (load_kwh - solar_kwh) / hours) / DISCHARGE_EFFICIENCY)
         full_kw = min(MAX_DISCHARGE_KW, MAX_DISCHARGE_AMPS * volts / 1000.0, export_cap_kw)
+
+    # Power Down token: export at least PD_MIN_EXPORT_KWH, using battery held
+    # for a later Axle event if need be (the pre-charge refills it before then).
+    min_export_released_kwh = 0.0
+    if session.get("kind", "power_down") == "power_down" and PD_MIN_EXPORT_KWH > 0 \
+            and refillable_kwh > 0 and hours > 0 and full_kw > 0:
+        needed = min_export_battery_kwh(start, end, full_kw, load_kw, solar_kw, PD_MIN_EXPORT_KWH)
+        short = needed - (battery_at_start - target_kwh)
+        if short > 0:
+            # Release in whole SOC steps until the spare covers it (stop SOC rounds down).
+            release = min(refillable_kwh, short)
+            while True:
+                reserve_kwh, stop_soc, target_kwh = reserve_for(held_kwh - release)
+                if battery_at_start - target_kwh >= needed - 1e-6 or release >= refillable_kwh:
+                    break
+                release = min(refillable_kwh, release + cap / 100.0)
+            min_export_released_kwh = release
 
     # Top up before the window: enough for full rate from start to end.
     pc = {"pre_charge_kwh": 0.0, "pre_charge_start": None, "pre_charge_window": None,
@@ -1335,7 +1399,8 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_t
         "battery_at_start_without_pre_charge_kwh": round(without_pre_charge_kwh, 2),
         "reserve_kwh": round(reserve_kwh, 2),
         "target_kwh": round(target_kwh, 2),
-        "held_for_power_down_kwh": round(held_kwh, 2),
+        "held_for_power_down_kwh": round(held_kwh - min_export_released_kwh, 2),
+        "released_for_min_export_kwh": round(min_export_released_kwh, 2),
         "evening_load_kwh": round(evening_kwh, 2),
         "spare_kwh": round(spare_kwh, 2),
         "battery_used_kwh": round(battery_used_kwh, 2),
