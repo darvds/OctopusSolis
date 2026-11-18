@@ -59,7 +59,7 @@ So the grid only covers house load above roughly the full discharge rate. The pl
 
 The slot is written `prepare_minutes` before the window, starting at the full-rate part. Every minute it's re-planned from the real SOC. Before the full-rate part begins, its start moves if the house uses more or less than predicted. It isn't moved later while the slot can still run at `export_keep_start_rate` of full rate from the start already written, so the inverter isn't rewritten for every 1% of SOC. Once the full-rate part is running, its start stays put and only the current is adjusted, so the battery ends at the reserve.
 
-The slot's stop SOC is `stop_soc_margin` (3%) below that finish, never below `floor_soc`. When a Solis timed discharge reaches its stop SOC before the slot ends, the battery idles and the grid covers the house for the rest of the slot. So the app ends the export itself when the battery reaches the planned finish, switching back to self-use, and the inverter's stop SOC is only a fail-safe.
+The slot's stop SOC is `stop_soc_margin` (3%) below that finish. At the floor (`floor_soc`, or `min_cut_off_soc` if that's higher: 7%, the lowest Solis accepts) there's no margin: the stop SOC is the floor and the export finishes there. When a Solis timed discharge reaches its stop SOC before the slot ends, the battery idles and the grid covers the house for the rest of the slot. So the app ends the export itself when the battery reaches the planned finish, switching back to self-use, and the inverter's stop SOC is only a fail-safe.
 
 **Axle Energy.** See [Axle Energy](#axle-energy) below.
 
@@ -132,6 +132,7 @@ The app drives the inverter only through the [Solis Modbus](https://github.com/P
 
 - Writes use the standard `time.set_value`, `number.set_value` and `switch.turn_on` / `turn_off` actions, one at a time, under one lock.
 - A slot is switched off before it's cleared, and only switched on once its window, current and SOC are written. A failed write stops the batch, so a half-written slot is never switched on. It's retried at the next check.
+- Every check, the app compares its slots' switch, current and stop SOC with what Solis Modbus shows. If something else changed them (Axle, the Solis app, a write that didn't take), the slot is rewritten and the change is logged. It waits 90 s after a write before checking, and stops after 3 rewrites in a row of the same difference, in case the inverter won't take a value.
 - Switches already in the right state aren't written again. Solis Modbus keeps the other slots' on/off bits as they are.
 - Entities created by older Solis Modbus versions keep their old IDs (e.g. `switch.solis_solis_grid_time_of_use_charging_period_1`). When the exact ID isn't there, the app uses the one entity whose ID ends the same way, and logs which one.
 - The prefix comes from the inverter's device name in Solis Modbus. It's found automatically from `time.*_grid_time_of_use_charge_start_slot_1`. With more than one inverter, set `inverter_prefix`.
@@ -215,6 +216,7 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 | `soc_sensor` | **required for exports** | Battery SOC (%) |
 | `capacity_kwh` | `10` | Usable capacity |
 | `floor_soc` | `15` | Lowest SOC an export discharges to |
+| `min_cut_off_soc` | `7` | Lowest stop SOC the inverter accepts in a discharge slot. Solis refuses anything lower and keeps the slot's old value, so the slot's stop SOC is never written below this. |
 | `core_charge_soc` | `100` | SOC reached by the end of the cheap window |
 | `load_power_sensor` | none | House load (W or kW) for the history |
 | `history_days` | `14` | Days of history to average |
@@ -229,7 +231,7 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 | `charge_efficiency` | `0.95` | AC-to-battery efficiency, for sizing the Axle pre-charge |
 | `min_export_kw` | `0.2` | Only export when it exports at least this rate |
 | `export_start_step_minutes` | `5` | The full-rate export starts on a multiple of this many minutes |
-| `stop_soc_margin` | `3` | The slot's stop SOC sits this many % below where the export plans to finish (never below `floor_soc`), so the app ends the export, not the inverter |
+| `stop_soc_margin` | `3` | The slot's stop SOC sits this many % below where the export plans to finish (never below `floor_soc`), so the app ends the export, not the inverter. Not used when the export finishes at the floor. |
 | `export_keep_start_rate` | `0.8` | Keep an already-written start while the slot can still run at this share of full rate from it |
 | `current_step_amps` | `5` | Minimum change before the current is rewritten |
 | `prepare_minutes` | `15` | Write the discharge slot this long before a window |
@@ -335,6 +337,7 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 
 - **A feature isn't doing anything.** Check the `features` attribute on `sensor.solis_octopus`. Then check the `*_events` health attributes on its own sensor. A typo in an entity ID shows as `missing`, with a `warning`.
 - **"Not starting: fix the slots config first".** Two features are set to the same charge slot. The details are in `slot_problems` on `sensor.solis_octopus`.
+- **The export slot is on but the battery doesn't discharge.** Check the slot's stop SOC on the inverter. The app now rewrites it if it differs from what it wrote; look for "slot changed on the inverter" in the log and `decision`.
 - **Slots at the wrong times.** Check the inverter clock (Solis Modbus's clock sync) and `inverter_timezone`.
 - **"Solis Modbus entities missing or unavailable".** The log names them. Check the Solis Modbus integration is connected, isn't in read-only mode, and shows the *Grid Time of Use* entities for your inverter. If your entity IDs start with something other than the detected prefix, set `inverter_prefix`.
 - **Axle's settings get overwritten (Events Only).** Make sure Axle doesn't use the same Solis slots as this app, and change `slots:` if it does. Or switch Axle to Self-Dispatch and set `axle: control: true`.

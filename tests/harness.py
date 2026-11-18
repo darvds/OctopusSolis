@@ -309,6 +309,14 @@ class App:
 
         g["fetch_load_profile"] = fake_fetch
         g["_flags"]["started"] = started
+        real_reconcile = g["_reconcile"]
+
+        async def mirrored_reconcile(reason):
+            if self.mirror_slots:
+                self.mirror_inverter()
+            return await real_reconcile(reason)
+
+        g["_reconcile"] = mirrored_reconcile
         self.g = g
         self.set_soc(80)
         self.at("12:00")
@@ -424,9 +432,19 @@ class App:
         async def fake_apply(ops):
             if ops:
                 self.ops.append(list(ops))
-            if results is not None:
-                return results.pop(0) if results else True
-            return ok
+            done = (results.pop(0) if results else True) if results is not None else ok
+            if done:
+                # The inverter now holds what was written, as Solis Modbus would show it.
+                for op in ops:
+                    if op[0] == "switch":
+                        self.states[op[1]] = ("on" if op[2] else "off", {})
+                    elif op[0] == "value":
+                        self.states[op[1]] = (str(float(op[2])), {})
+                    elif op[0] == "time":
+                        a, b = op[2].split("-")
+                        self.states[op[1][0]] = (a + ":00", {})
+                        self.states[op[1][1]] = (b + ":00", {})
+            return done
 
         self.g["solis_apply"] = fake_apply
         return self.ops
@@ -436,6 +454,22 @@ class App:
 
     def reconcile(self, reason="test"):
         return self.run(self.g["reconcile"](reason))
+
+    # Tests often set the app's slot memory directly. Unless a test turns this
+    # off (to change the inverter behind the app's back), the fake inverter is
+    # made to hold the same before each check.
+    mirror_slots = True
+
+    def mirror_inverter(self):
+        for key, program in self.g["_slots"].items():
+            if program["unknown"] or key not in self.g["active_slot_keys"]():
+                continue
+            _, current_id, soc_id, switch_id = self.g["slot_entities"](key)
+            self.states[switch_id] = ("on" if program["enabled"] else "off", {})
+            if program["current"] is not None:
+                self.states[current_id] = (str(float(program["current"])), {})
+            if program["soc"] is not None:
+                self.states[soc_id] = (str(float(program["soc"])), {})
 
     def _last(self, entity):
         sets = [s for s in self.state_sets if s[0] == entity]

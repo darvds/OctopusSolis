@@ -15,7 +15,8 @@ def pc_app(axle=None, *more):
     """
     cfg = {"control": True}
     cfg.update(axle or {})
-    app = App({"axle_events": True, "axle": cfg, "battery": {"charge_efficiency": 1.0}}, *more)
+    # Floor 13%: these tests were sized when exports finished 3% above a 10% floor.
+    app = App({"axle_events": True, "axle": cfg, "battery": {"charge_efficiency": 1.0, "floor_soc": 13}}, *more)
     app.capture_ops()
     app.known()
     app.g["_slots"]["core"].update({"window": "23:30-05:30", "enabled": True})
@@ -79,8 +80,8 @@ class PlanTests(unittest.TestCase):
         app = pc_app({"keep_evening_reserve": True})
         ev = app.axle_event(local("12:00"))
         plan = app.predict(ev, local("12:00"), 40, None, {}, {}, [], False, None, True)
-        # Floor + 18:30-23:30 at 0.5 kW + 5 kWh for the event.
-        self.assertEqual(plan["pre_charge_soc"], 85)
+        # Floor (13%) + 18:30-23:30 at 0.5 kW + 5 kWh for the event.
+        self.assertEqual(plan["pre_charge_soc"], 88)
 
     def test_charge_power_capped_by_current(self):
         app = pc_app({"pre_charge_current": 50})
@@ -115,7 +116,7 @@ class SlotTests(unittest.TestCase):
         app.set_soc(51)
         app.reconcile()
         self.assertEqual(app.ops, [[("time", EXPORT_TIME, "17:30-18:30"), ("value", EXPORT_CURRENT, "100"),
-                                    ("value", EXPORT_SOC, "10"), ("switch", EXPORT_SWITCH, True)]])
+                                    ("value", EXPORT_SOC, "13"), ("switch", EXPORT_SWITCH, True)]])
         # Full already: the slot stays on, holding the SOC until the event.
         app.ops.clear()
         app.at("17:25")
@@ -283,7 +284,7 @@ def token_app(pd=None, axle=None):
     from tests.harness import event
     cfg = {"control": True}
     cfg.update(axle or {})
-    app = App({"axle_events": True, "axle": cfg, "battery": {"charge_efficiency": 1.0},
+    app = App({"axle_events": True, "axle": cfg, "battery": {"charge_efficiency": 1.0, "floor_soc": 13},
                "power_down": pd or {}})
     app.capture_ops()
     app.known()
@@ -326,3 +327,23 @@ class PowerDownMinExportTests(unittest.TestCase):
         _, state, attrs = token_app(axle={"pre_charge": False}).status()
         self.assertEqual(state, "no_spare_energy")
         self.assertEqual(attrs["released_for_min_export_kwh"], 0)
+
+
+class MinCutOffSocTests(unittest.TestCase):
+    def test_stop_soc_never_below_what_solis_accepts(self):
+        app = App({"axle_events": True, "axle": {"control": True, "pre_charge": False},
+                   "battery": {"floor_soc": 5}})
+        app.set_axle("export", "17:30", "18:30")
+        ev = app.axle_event(local("12:00"))
+        plan = app.predict(ev, local("12:00"), 100, None, {}, {}, [], True, None, False)
+        # The export finishes at 7% too, not a margin above it.
+        self.assertEqual(plan["stop_soc"], 7)
+        self.assertEqual(plan["target_kwh"], 0.7)
+
+    def test_configurable(self):
+        app = App({"axle_events": True, "axle": {"control": True, "pre_charge": False},
+                   "battery": {"floor_soc": 5, "min_cut_off_soc": 5}})
+        app.set_axle("export", "17:30", "18:30")
+        ev = app.axle_event(local("12:00"))
+        plan = app.predict(ev, local("12:00"), 100, None, {}, {}, [], True, None, False)
+        self.assertEqual(plan["stop_soc"], 5)
