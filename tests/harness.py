@@ -47,8 +47,6 @@ BASE_CONFIG = {
         "discharge_efficiency": 1.0,
     },
     "power_down": {"power_down_events_entity": EVENTS},
-    # Off here so the other suites' write checks stay exact; tests/test_floor_discharge_slots.py turns it on.
-    "slots": {"floor_other_discharge_slots": False},
 }
 
 EV_CONFIG = {"ev_follow": {"dispatch_sensor": DISPATCH}}

@@ -169,10 +169,6 @@ HH_SLOT = int(SLC.get("happy_hour", 3))
 DISCHARGE_SLOT = int(SLC.get("export", 1))
 AXLE_CHARGE_SLOT = int(SLC.get("axle_charge", 4))
 CLEAR_OTHER_SLOTS = _cfg_bool("clear_other_charge_slots", False, SLC)
-# Keep the cut-off SOC of the discharge slots we don't use at floor_soc. The
-# inverter stops a timed discharge at a higher cut-off set in one of those, so
-# a stale one (e.g. 44% left by Axle or another app) would block our export.
-FLOOR_OTHER_DISCHARGE = _cfg_bool("floor_other_discharge_slots", True, SLC)
 
 # --- Battery / prediction ---
 SOC_SENSOR = str(BAT.get("soc_sensor", ""))
@@ -2278,22 +2274,6 @@ def clear_other_ops():
     return ops
 
 
-def floor_other_discharge_ops():
-    """Set the cut-off SOC of the discharge slots we don't use to floor_soc where it differs."""
-    if not FLOOR_OTHER_DISCHARGE:
-        return []
-    ops = []
-    for num in range(1, 7):
-        if num == DISCHARGE_SLOT:
-            continue
-        _, _, soc_id, _ = slot_entity_ids("discharge", num)
-        value = _float_state(soc_id)
-        if value is None or _same_number(value, FLOOR_SOC):
-            continue
-        ops.append(("value", soc_id, str(FLOOR_SOC)))
-    return ops
-
-
 async def reconcile(reason):
     if not _flags["started"]:
         log.debug("[%s] not started yet", reason)
@@ -2375,11 +2355,6 @@ async def _reconcile(reason):
     ops = order_ops(per_slot)
     if CLEAR_OTHER_SLOTS and not _flags["others_cleared"] and not axle_running:
         ops = clear_other_ops() + ops
-    if not axle_running:
-        floor_ops = floor_other_discharge_ops()
-        if floor_ops:
-            log.info("[%s] discharge cut-off SOC on unused slots isn't floor_soc (%s%%)", reason, FLOOR_SOC)
-            ops = floor_ops + ops
 
     if ops:
         log.info("[%s] writing %s (%s)", reason, ops, "; ".join(notes) or "no conflicts")
