@@ -59,7 +59,7 @@ So the grid only covers house load above roughly the full discharge rate. The pl
 
 The slot is written `prepare_minutes` before the window, starting at the full-rate part. Every minute it's re-planned from the real SOC. Before the full-rate part begins, its start moves if the house uses more or less than predicted. It isn't moved later while the slot can still run at `export_keep_start_rate` of full rate from the start already written, so the inverter isn't rewritten for every 1% of SOC. Once the full-rate part is running, its start stays put and only the current is adjusted, so the battery ends at the reserve.
 
-The slot's stop SOC is `stop_soc_margin` (3%) below that finish, never below `floor_soc`. When a Solis timed discharge reaches its stop SOC before the slot ends, the battery idles and the grid covers the house for the rest of the slot. So the app ends the export itself when the battery reaches the planned finish, switching back to self-use, and the inverter's stop SOC is only a fail-safe.
+The slot's stop SOC is `stop_soc_margin` (3%) below that finish, never below `floor_soc` or `min_cut_off_soc` (7%, the lowest Solis accepts). When a Solis timed discharge reaches its stop SOC before the slot ends, the battery idles and the grid covers the house for the rest of the slot. So the app ends the export itself when the battery reaches the planned finish, switching back to self-use, and the inverter's stop SOC is only a fail-safe.
 
 **Axle Energy.** See [Axle Energy](#axle-energy) below.
 
@@ -216,6 +216,7 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 | `soc_sensor` | **required for exports** | Battery SOC (%) |
 | `capacity_kwh` | `10` | Usable capacity |
 | `floor_soc` | `15` | Lowest SOC an export discharges to |
+| `min_cut_off_soc` | `7` | Lowest stop SOC the inverter accepts in a discharge slot. Solis refuses anything lower and keeps the slot's old value, so the slot's stop SOC is never written below this. |
 | `core_charge_soc` | `100` | SOC reached by the end of the cheap window |
 | `load_power_sensor` | none | House load (W or kW) for the history |
 | `history_days` | `14` | Days of history to average |

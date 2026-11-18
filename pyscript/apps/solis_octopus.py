@@ -174,6 +174,9 @@ CLEAR_OTHER_SLOTS = _cfg_bool("clear_other_charge_slots", False, SLC)
 SOC_SENSOR = str(BAT.get("soc_sensor", ""))
 BATTERY_CAPACITY_KWH = float(BAT.get("capacity_kwh", 10.0))
 FLOOR_SOC = int(BAT.get("floor_soc", 15))
+# The lowest discharge cut-off SOC the inverter accepts. Solis refuses lower
+# values and keeps the old one, which can stop an export early.
+MIN_CUT_OFF_SOC = int(BAT.get("min_cut_off_soc", 7))
 RESERVE_MARGIN = float(BAT.get("reserve_margin", 1.2))
 CORE_CHARGE_SOC = int(BAT.get("core_charge_soc", 100))
 LOAD_POWER_SENSOR = str(BAT.get("load_power_sensor", ""))
@@ -1239,7 +1242,7 @@ def predict(session, now, soc, voltage, load_profile, solar, later=None, drain_t
         stop = 100
         if cap > 0:
             stop = int(math.floor(reserve / cap * 100.0 + 1e-6)) - STOP_SOC_MARGIN
-        stop = max(FLOOR_SOC, min(100, stop))
+        stop = max(FLOOR_SOC, MIN_CUT_OFF_SOC, min(100, stop))
         return reserve, stop, min(cap, max(reserve, (stop + STOP_SOC_MARGIN) / 100.0 * cap))
 
     reserve_kwh, stop_soc, target_kwh = reserve_for(held_kwh)

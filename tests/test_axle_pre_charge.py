@@ -326,3 +326,21 @@ class PowerDownMinExportTests(unittest.TestCase):
         _, state, attrs = token_app(axle={"pre_charge": False}).status()
         self.assertEqual(state, "no_spare_energy")
         self.assertEqual(attrs["released_for_min_export_kwh"], 0)
+
+
+class MinCutOffSocTests(unittest.TestCase):
+    def test_stop_soc_never_below_what_solis_accepts(self):
+        app = App({"axle_events": True, "axle": {"control": True, "pre_charge": False},
+                   "battery": {"floor_soc": 5}})
+        app.set_axle("export", "17:30", "18:30")
+        ev = app.axle_event(local("12:00"))
+        plan = app.predict(ev, local("12:00"), 100, None, {}, {}, [], True, None, False)
+        self.assertEqual(plan["stop_soc"], 7)
+
+    def test_configurable(self):
+        app = App({"axle_events": True, "axle": {"control": True, "pre_charge": False},
+                   "battery": {"floor_soc": 5, "min_cut_off_soc": 5}})
+        app.set_axle("export", "17:30", "18:30")
+        ev = app.axle_event(local("12:00"))
+        plan = app.predict(ev, local("12:00"), 100, None, {}, {}, [], True, None, False)
+        self.assertEqual(plan["stop_soc"], 5)
