@@ -33,6 +33,7 @@ pyscript:
         export: 1               # discharge slot: Power Down / peak export
         axle_charge: 4          # charge slot: Axle pre-charge (axle control: true)
         clear_other_charge_slots: false   # clear unused charge slots once at startup
+        floor_other_discharge_slots: true # keep unused discharge slots' cut-off SOC at floor_soc
 
       # --- Battery and export prediction ---
       battery:

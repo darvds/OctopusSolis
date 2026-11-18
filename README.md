@@ -207,6 +207,7 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 | `export` | `1` | Discharge slot for exports |
 | `axle_charge` | `4` | Charge slot for the Axle pre-charge (`axle: control: true` with `pre_charge` on) |
 | `clear_other_charge_slots` | `false` | Clear unused charge slots once at startup. Leave it off if Axle or anything else uses them. |
+| `floor_other_discharge_slots` | `true` | Keep the cut-off SOC of the discharge slots the app doesn't use at `battery.floor_soc`. The inverter stops a timed discharge at a higher cut-off left in another discharge slot (by Axle, another app or by hand), which blocks exports. Not written while Axle drives the battery (Events Only). |
 
 **`battery:`**
 
@@ -335,6 +336,7 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 
 - **A feature isn't doing anything.** Check the `features` attribute on `sensor.solis_octopus`. Then check the `*_events` health attributes on its own sensor. A typo in an entity ID shows as `missing`, with a `warning`.
 - **"Not starting: fix the slots config first".** Two features are set to the same charge slot. The details are in `slot_problems` on `sensor.solis_octopus`.
+- **The export slot is on but the battery doesn't discharge.** Check the cut-off SOC of the *other* discharge slots: a higher one (e.g. 44%) stops the export there. `floor_other_discharge_slots` (on by default) keeps them at `floor_soc`.
 - **Slots at the wrong times.** Check the inverter clock (Solis Modbus's clock sync) and `inverter_timezone`.
 - **"Solis Modbus entities missing or unavailable".** The log names them. Check the Solis Modbus integration is connected, isn't in read-only mode, and shows the *Grid Time of Use* entities for your inverter. If your entity IDs start with something other than the detected prefix, set `inverter_prefix`.
 - **Axle's settings get overwritten (Events Only).** Make sure Axle doesn't use the same Solis slots as this app, and change `slots:` if it does. Or switch Axle to Self-Dispatch and set `axle: control: true`.
