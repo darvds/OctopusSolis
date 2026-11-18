@@ -31,7 +31,7 @@ Now one app decides what every slot should hold, in one pass, with one priority 
 | 5 | **Daily peak export** | Exports what's spare in the peak window (e.g. 16:00–19:00). |
 | 6 | **Core overnight window** | Always programmed in its own charge slot. |
 
-Before an Axle export event or a Power Down session, earlier export windows **hold battery back** for it. That covers as much as the battery could export at full power, and shows as `held_for_power_down_kwh`.
+Before an Axle export event or a Power Down session, earlier export windows **hold battery back** for it. That covers as much as the battery could export at full power, and shows as `held_for_power_down_kwh`. A Power Down session still exports at least `min_export_kwh` (0.5 kWh) to earn its token, using battery held for an Axle event that the pre-charge refills. That release shows as `released_for_min_export_kwh`.
 
 ## The features
 
@@ -279,6 +279,7 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 |---|---|---|
 | `power_down_events_entity` | **required** | `event.octopus_energy_<account>_octoplus_power_down_events` |
 | `auto_join` | `true` | Join every available session |
+| `min_export_kwh` | `0.5` | Always export at least this much in a session, so it earns the session's token. When the battery is being held back for a later Axle export event, the app releases enough of it, because the Axle pre-charge tops it up again before that event. `0` turns this off. |
 
 **`peak_export:`**
 

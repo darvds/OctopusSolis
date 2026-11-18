@@ -103,6 +103,7 @@ pyscript:
       power_down:
         power_down_events_entity: event.octopus_energy_a_XXXXXXXX_octoplus_power_down_events
         auto_join: true
+        # min_export_kwh: 0.5   # always export this much per session (earns its token)
 
       # --- Daily peak export ---
       peak_export:

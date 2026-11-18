@@ -276,3 +276,53 @@ class OtherWindowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def token_app(pd=None, axle=None):
+    """Power Down 16:00-17:00 then an Axle export 20:00-21:00 the app pre-charges for."""
+    from tests.harness import event
+    cfg = {"control": True}
+    cfg.update(axle or {})
+    app = App({"axle_events": True, "axle": cfg, "battery": {"charge_efficiency": 1.0},
+               "power_down": pd or {}})
+    app.capture_ops()
+    app.known()
+    app.g["_slots"]["core"].update({"window": "23:30-05:30", "enabled": True})
+    app.set_events(joined=[event("16:00", "17:00")])
+    app.set_axle("export", "20:00", "21:00")
+    app.at("15:55")
+    app.set_soc(80)
+    app.reconcile()
+    return app
+
+
+class PowerDownMinExportTests(unittest.TestCase):
+    """A Power Down session always exports a little (its token), even before an Axle event."""
+
+    def test_exports_the_minimum_using_battery_held_for_axle(self):
+        app = token_app()
+        _, state, attrs = app.status()
+        self.assertEqual(state, "armed")
+        self.assertEqual(attrs["window_kind"], "power_down")
+        self.assertGreaterEqual(attrs["predicted_export_kwh"], 0.5)
+        self.assertLess(attrs["predicted_export_kwh"], 0.6)
+        self.assertGreater(attrs["released_for_min_export_kwh"], 0)
+
+    def test_axle_pre_charge_still_tops_up_afterwards(self):
+        app = token_app()
+        app.at("19:00")
+        app.set_soc(30)
+        app.reconcile()
+        pc = app.status()[2]["axle_pre_charge"]
+        self.assertIsNotNone(pc["planned_window"])
+        self.assertEqual(pc["target_soc"], 63)
+
+    def test_minimum_can_be_turned_off(self):
+        _, state, attrs = token_app({"min_export_kwh": 0}).status()
+        self.assertEqual(state, "no_spare_energy")
+        self.assertEqual(attrs["released_for_min_export_kwh"], 0)
+
+    def test_nothing_released_without_the_pre_charge(self):
+        _, state, attrs = token_app(axle={"pre_charge": False}).status()
+        self.assertEqual(state, "no_spare_energy")
+        self.assertEqual(attrs["released_for_min_export_kwh"], 0)
