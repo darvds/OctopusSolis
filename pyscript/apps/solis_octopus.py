@@ -51,7 +51,7 @@ from zoneinfo import ZoneInfo
 log = logging.getLogger("pyscript.solis_octopus")
 log.setLevel(logging.DEBUG)
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 
 # -----------------------------
 # Solis Modbus entities (Grid Time of Use, 6 slots)
