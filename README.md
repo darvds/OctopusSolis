@@ -272,7 +272,8 @@ Your dashboards keep working. `sensor.solis_ev_charge_slot`, `sensor.octopus_hap
 | `schedule_id` | `1` | The car's charge schedule to rewrite |
 | `normal_window` | `core_window` | Schedule outside happy hours |
 | `prepare_minutes` | `10` | Move the schedule this long before a happy hour |
-| `retry_minutes` | `5` | Wait between retries after a failed write |
+| `retry_minutes` | `5` | Wait between retries after a failed write. Moving into a happy hour always retries this often. |
+| `max_retry_minutes` | `60` | Going back to the normal window backs off while Renault's servers keep failing: 5, 10, 20, 40 minutes, then hourly |
 | `notify` | `true` | Notify when the schedule is restored, and when it can't be set |
 
 **`power_down:`**
