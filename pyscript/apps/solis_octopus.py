@@ -2397,7 +2397,7 @@ async def _reconcile(reason):
         wants["axle_charge"] = pc_want
         for key in active_slot_keys():
             drift = slot_drift(key, now)
-            text = ", ".join(f"{e} is {live}, we wrote {ours}" for e, live, ours in drift)
+            text = ", ".join([f"{e} is {live}, we wrote {ours}" for e, live, ours in drift])
             seen = _drift_seen.get(key)
             if not drift:
                 _drift_seen.pop(key, None)
