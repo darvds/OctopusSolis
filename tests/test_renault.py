@@ -119,6 +119,17 @@ class RenaultScheduleTests(unittest.TestCase):
         app.reconcile()
         self.assertEqual(windows(app), [("T14:00Z", 60)])
 
+    def test_restoring_the_normal_window_backs_off(self):
+        app = renault_app()
+        app.services.fail.add(("renault", "charge_set_schedules"))
+        with self.assertLogs("pyscript.solis_octopus", level="ERROR"):
+            for minute in range(0, 180):
+                app.at(f"{9 + minute // 60:02d}:{minute % 60:02d}")
+                app.reconcile()
+        times = [c for c in schedule_calls(app)]
+        # 09:00, then after 5, 10, 20, 40 and 60 minutes: 09:05, 09:15, 09:35, 10:15, 11:15.
+        self.assertEqual(len(times), 6)
+
     def test_custom_normal_window_and_schedule_id(self):
         app = renault_app({"normal_window": "00:30-04:30", "schedule_id": 2}, start=None)
         app.reconcile()

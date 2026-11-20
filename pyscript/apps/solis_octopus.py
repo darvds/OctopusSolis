@@ -285,6 +285,7 @@ RENAULT_SCHEDULE_ID = int(RNC.get("schedule_id", 1))
 RENAULT_NORMAL_WINDOW = str(RNC.get("normal_window", CORE_WINDOW))
 RENAULT_PREPARE_MINUTES = int(RNC.get("prepare_minutes", 10))
 RENAULT_RETRY_MINUTES = int(RNC.get("retry_minutes", 5))
+RENAULT_MAX_RETRY_MINUTES = max(RENAULT_RETRY_MINUTES, int(RNC.get("max_retry_minutes", 60)))
 RENAULT_NOTIFY = _cfg_bool("notify", True, RNC)
 if RENAULT_ENABLED and not RENAULT_VEHICLE:
     log.error("renault.vehicle (the Renault device ID) isn't set; the car's charge schedule won't be changed")
@@ -1905,6 +1906,18 @@ def car_window_text(start, minutes):
     return fmt_window(start, start + timedelta(minutes=minutes))
 
 
+def car_retry_minutes(mode):
+    """
+    Wait before retrying a failed schedule write. Moving into a happy hour is
+    retried every retry_minutes (it's time-critical). Going back to the normal
+    window backs off (doubling up to an hour) while the Renault servers keep
+    failing, since the normal window is hours away.
+    """
+    if mode == "happy_hour" or _car["failures"] <= 1:
+        return RENAULT_RETRY_MINUTES
+    return min(RENAULT_MAX_RETRY_MINUTES, RENAULT_RETRY_MINUTES * 2 ** (_car["failures"] - 1))
+
+
 async def car_schedule_sync(window, now):
     """
     Set the car's charge schedule to the happy hour (from prepare_minutes before
@@ -1917,7 +1930,7 @@ async def car_schedule_sync(window, now):
         return
     if _car["wanted"] != key:
         _car["wanted"], _car["failed_at"], _car["failures"] = key, None, 0
-    if _car["failed_at"] is not None and now - _car["failed_at"] < timedelta(minutes=RENAULT_RETRY_MINUTES):
+    if _car["failed_at"] is not None and now - _car["failed_at"] < timedelta(minutes=car_retry_minutes(mode)):
         return
 
     text = car_window_text(start, minutes)
@@ -1934,7 +1947,7 @@ async def car_schedule_sync(window, now):
             _car["failed_at"] = now
             _car["failures"] += 1
             log.error("Setting %s charge schedule to %s failed: %s (retrying in %s min)",
-                      RENAULT_NAME, text, e, RENAULT_RETRY_MINUTES)
+                      RENAULT_NAME, text, e, car_retry_minutes(mode))
             if RENAULT_NOTIFY and _car["failures"] >= 3 and _car["fail_notified"] != key:
                 _car["fail_notified"] = key
                 await notify(f"{RENAULT_NAME} schedule not set",
